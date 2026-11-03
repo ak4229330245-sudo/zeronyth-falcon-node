@@ -17,10 +17,10 @@ sudo apt update && sudo apt install -y curl python3
 mkdir -p ~/zeronyth-java && curl -fL "https://api.adoptium.net/v3/binary/latest/25/ga/linux/$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')/jre/hotspot/normal/eclipse" | tar xz -C ~/zeronyth-java --strip-components=1
 export JAVA_HOME=~/zeronyth-java PATH=~/zeronyth-java/bin:$PATH && java -version
 
-REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.1.0
-curl -fLO $REL/zeronyth-falcon-node-912701-v0.1.0.tar.gz -fLO $REL/SHA256SUMS
+REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.1.1
+curl -fLO $REL/zeronyth-falcon-node-912701-v0.1.1.tar.gz -fLO $REL/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing      # must print: OK
-tar xzf zeronyth-falcon-node-912701-v0.1.0.tar.gz && cd zeronyth-falcon-node-912701-v0.1.0
+tar xzf zeronyth-falcon-node-912701-v0.1.1.tar.gz && cd zeronyth-falcon-node-912701-v0.1.1
 ```
 
 ## 2. Create your Falcon key (encrypted)
@@ -48,7 +48,9 @@ The node connects to the public bootnode `58.191.52.149:30303` (it is listed in 
 curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8545
 curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"net_peerCount","params":[]}' http://127.0.0.1:8545
 ```
-Sync is done when the block number matches the latest block on https://zeronyth.dpdns.org/validator-apply.html. Blocks are produced every 1 s.
+Sync is done when the block number matches the latest block on https://zeronyth.dpdns.org/validator-apply.html. Blocks are produced every 1 s. In our test, a fresh node with one peer caught up about 10,500 blocks in under a minute.
+
+If the log keeps showing `Unable to retrieve blocks`, you are using v0.1.0. Upgrade to v0.1.1 or later, which keeps header requests small because Falcon-1024 headers are about 10 KB each.
 
 ## 5. Your enode (public)
 ```bash

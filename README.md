@@ -1,4 +1,4 @@
-# ZERONYTH Falcon node — chain 912701 (test net) — v0.1.0
+# ZERONYTH Falcon node — chain 912701 (test net) — v0.1.1
 
 This package runs a non-validator full node on the ZERONYTH Falcon test net (chain ID 912701, QBFT, 1-second blocks, Falcon-1024 block seals).
 

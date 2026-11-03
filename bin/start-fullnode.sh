@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Start a NON-VALIDATOR full node for the ZERONYTH Falcon test net (chain 912701).
 # Usage: bin/start-fullnode.sh [DIR]   (DIR defaults to ~/zeronyth-912701; run bin/zeronyth-falcon-key init first)
-# Env: P2P_PORT (30303), RPC_PORT (8545), P2P_HOST (your public IP if you accept inbound peers), XMX (1g)
+# Env: P2P_PORT (30303), RPC_PORT (8545), P2P_HOST (your public IP if you accept inbound peers), XMX (1g), EXTRA_BESU_ARGS
+# Sync tuning: Falcon-1024 seals make each header ~10 KB, so header requests are kept small and few;
+# with Besu defaults a node with a single peer stalls ("Unable to retrieve blocks").
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; D="${1:-$HOME/zeronyth-912701}"
 G="$HERE/config/genesis-falcon-912701.json"
@@ -22,4 +24,6 @@ exec "$HERE/besu/bin/besu" --genesis-file="$G" --network-id=912701 \
   --bootnodes="$(cat "$HERE/config/bootnodes.txt")" --static-nodes-file="$D/static-nodes.json" \
   --p2p-port="${P2P_PORT:-30303}" "${NAT[@]}" \
   --rpc-http-enabled --rpc-http-host=127.0.0.1 --rpc-http-port="${RPC_PORT:-8545}" \
-  --rpc-http-api=ETH,NET,WEB3,QBFT,ADMIN --host-allowlist=localhost,127.0.0.1 --min-gas-price=0
+  --rpc-http-api=ETH,NET,WEB3,QBFT,ADMIN --host-allowlist=localhost,127.0.0.1 --min-gas-price=0 \
+  --Xsynchronizer-header-download-parallelism-factor=1 --Xsynchronizer-downloader-parallelism=2 \
+  --Xsynchronizer-downloader-header-request-size=64 ${EXTRA_BESU_ARGS:-}

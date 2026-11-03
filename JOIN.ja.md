@@ -18,10 +18,10 @@ sudo apt update && sudo apt install -y curl python3
 mkdir -p ~/zeronyth-java && curl -fL "https://api.adoptium.net/v3/binary/latest/25/ga/linux/$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')/jre/hotspot/normal/eclipse" | tar xz -C ~/zeronyth-java --strip-components=1
 export JAVA_HOME=~/zeronyth-java PATH=~/zeronyth-java/bin:$PATH && java -version
 
-REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.1.0
-curl -fLO $REL/zeronyth-falcon-node-912701-v0.1.0.tar.gz -fLO $REL/SHA256SUMS
+REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.1.1
+curl -fLO $REL/zeronyth-falcon-node-912701-v0.1.1.tar.gz -fLO $REL/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing      # 「OK」と出ること
-tar xzf zeronyth-falcon-node-912701-v0.1.0.tar.gz && cd zeronyth-falcon-node-912701-v0.1.0
+tar xzf zeronyth-falcon-node-912701-v0.1.1.tar.gz && cd zeronyth-falcon-node-912701-v0.1.1
 ```
 
 ## 2. Falcon 鍵を作る（暗号化）
@@ -49,7 +49,9 @@ bin/start-fullnode.sh                 # データは ~/zeronyth-912701、P2P 303
 curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8545
 curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"net_peerCount","params":[]}' http://127.0.0.1:8545
 ```
-https://zeronyth.dpdns.org/validator-apply.html の「最新ブロック」と同じ数字になれば同期完了です。ブロックは1秒ごとに作られます。
+https://zeronyth.dpdns.org/validator-apply.html の「最新ブロック」と同じ数字になれば同期完了です。ブロックは1秒ごとに作られます。私たちのテストでは、ピア1つの新規ノードが約10,500ブロックに1分以内で追いつきました。
+
+ログに `Unable to retrieve blocks` が出続ける場合は v0.1.0 を使っています。v0.1.1 以降に更新してください。v0.1.1 では、1つあたり約10 KBある Falcon-1024 ヘッダーの要求を小さく抑えています。
 
 ## 5. 自分の enode（公開情報）
 ```bash
