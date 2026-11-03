@@ -1,0 +1,656 @@
+From 28a811b4800291f0015adb7a7a4322f3301b16ac Mon Sep 17 00:00:00 2001
+From: ZERONYTH dev <dev@zeronyth.invalid>
+Date: Tue, 3 Nov 2026 08:51:44 +0900
+Subject: [PATCH 4/7] Falcon/ML-DSA-65 finality: PQ_BINDING type,
+ Falcon1024PqTool helper, Falcon-aware attester, net scripts, rollout plan
+
+---
+ .../crypto/Falcon1024ConsensusCrypto.java     |  10 +-
+ .../besu/crypto/Falcon1024PqTool.java         | 130 ++++++++++++++
+ .../crypto/Falcon1024ConsensusCryptoTest.java |  37 +++-
+ zeronyth/README-falcon-qbft.md                |  39 +++++
+ zeronyth/falcon-net/falcon-addresses.txt      |   4 +
+ .../falcon-net/genesis-falcon-912701.json     |  27 +++
+ zeronyth/falcon-net/start-node.sh             |  31 ++++
+ zeronyth/falcon-net/tools/heights.sh          |  23 +++
+ zeronyth/falcon-net/tools/loadgen.mjs         |  70 ++++++++
+ .../falcon-net/tools/pq-finality-falcon.mjs   | 158 ++++++++++++++++++
+ zeronyth/falcon-net/validators.json           |   1 +
+ 11 files changed, 527 insertions(+), 3 deletions(-)
+ create mode 100644 crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024PqTool.java
+ create mode 100644 zeronyth/README-falcon-qbft.md
+ create mode 100644 zeronyth/falcon-net/falcon-addresses.txt
+ create mode 100644 zeronyth/falcon-net/genesis-falcon-912701.json
+ create mode 100755 zeronyth/falcon-net/start-node.sh
+ create mode 100755 zeronyth/falcon-net/tools/heights.sh
+ create mode 100644 zeronyth/falcon-net/tools/loadgen.mjs
+ create mode 100644 zeronyth/falcon-net/tools/pq-finality-falcon.mjs
+ create mode 100644 zeronyth/falcon-net/validators.json
+
+diff --git a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
+index 2236258..ff79449 100644
+--- a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
+@@ -53,6 +53,12 @@ public final class Falcon1024ConsensusCrypto {
+   /** Block header finality/commit seal; never reuse the COMMIT message signature. */
+   public static final int COMMIT_SEAL = 5;
+ 
++  /**
++   * Off-chain binding of a validator's ML-DSA-65 finality key to its Falcon validator address
++   * (height 0, round 0, payload = binding hash). Never accepted by any QBFT verifier path.
++   */
++  public static final int PQ_BINDING = 6;
++
+   private static final byte[] DOMAIN =
+       "ZERONYTH/QBFT/FALCON-1024/V1\u0000".getBytes(StandardCharsets.US_ASCII);
+ 
+@@ -70,7 +76,7 @@ public final class Falcon1024ConsensusCrypto {
+    * Canonical signature input; never sign an unscoped block hash or raw message bytes.
+    *
+    * @param chainId genesis network's chain ID, not the p2p network ID
+-   * @param messageType one of the five constants above
++   * @param messageType one of the constants above
+    * @param blockHeight QBFT sequence (block height)
+    * @param round QBFT round, zero or greater
+    * @param payloadHash 32-byte canonical hash of the existing QBFT payload or header
+@@ -85,7 +91,7 @@ public final class Falcon1024ConsensusCrypto {
+         || blockHeight < 0
+         || round < 0
+         || messageType < PROPOSAL
+-        || messageType > COMMIT_SEAL) {
++        || messageType > PQ_BINDING) {
+       throw new IllegalArgumentException("Invalid consensus domain values");
+     }
+     Objects.requireNonNull(payloadHash, "payloadHash");
+diff --git a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024PqTool.java b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024PqTool.java
+new file mode 100644
+index 0000000..60c73e0
+--- /dev/null
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024PqTool.java
+@@ -0,0 +1,130 @@
++/*
++ * Copyright contributors to Besu.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations under the License.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.io.BufferedReader;
++import java.io.InputStreamReader;
++import java.io.PrintStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.util.HexFormat;
++import java.util.List;
++
++/**
++ * Helper for the off-chain ML-DSA-65 finality attester on a Falcon-QBFT chain. Prints only public
++ * data (addresses, public signatures); never prints key material.
++ *
++ * <pre>
++ * bind-sign &lt;falconKeyFile&gt; &lt;chainId&gt; &lt;hash32hex&gt;   -> Falcon PQ_BINDING envelope hex
++ * serve   (stdin lines, one reply line each):
++ *   seals &lt;chainId&gt; &lt;height&gt; &lt;round&gt; &lt;hash32hex&gt; &lt;seal1hex,seal2hex,...&gt; -> addr|x,...
++ *   bind  &lt;chainId&gt; &lt;hash32hex&gt; &lt;envelopehex&gt;                              -> addr|x
++ * </pre>
++ */
++public final class Falcon1024PqTool {
++  private static final HexFormat HEX = HexFormat.of();
++
++  private Falcon1024PqTool() {}
++
++  private static byte[] hex(final String s) {
++    return HEX.parseHex(s.startsWith("0x") ? s.substring(2) : s);
++  }
++
++  private static String verify(
++      final byte[] env,
++      final long chainId,
++      final int type,
++      final long h,
++      final int r,
++      final byte[] hash) {
++    try {
++      final Falcon1024ConsensusEnvelope.VerifiedMessage m =
++          Falcon1024ConsensusEnvelope.decodeAndVerify(
++              env, chainId, type, hash, List.of(Falcon1024ConsensusEnvelope.publicKeyOf(env)));
++      if (m.blockHeight() != h || m.round() != r || m.chainId() != chainId) {
++        return "x";
++      }
++      return "0x" + HEX.formatHex(m.authorAddress());
++    } catch (final RuntimeException e) {
++      return "x";
++    }
++  }
++
++  /**
++   * Entry point.
++   *
++   * @param args see class doc
++   * @throws Exception on I/O error
++   */
++  public static void main(final String[] args) throws Exception {
++    final PrintStream out = System.out;
++    if (args.length == 4 && args[0].equals("bind-sign")) {
++      final Falcon1024KeyFile.KeyPair kp = Falcon1024KeyFile.load(Path.of(args[1]));
++      final byte[] env =
++          Falcon1024ConsensusEnvelope.signAndEncode(
++              kp.secret(),
++              kp.pub(),
++              SecureRandomProvider.createSecureRandom(),
++              Long.parseLong(args[2]),
++              Falcon1024ConsensusCrypto.PQ_BINDING,
++              0,
++              0,
++              hex(args[3]));
++      out.println("0x" + HEX.formatHex(env));
++      return;
++    }
++    if (args.length == 1 && args[0].equals("serve")) {
++      final BufferedReader in =
++          new BufferedReader(new InputStreamReader(System.in, StandardCharsets.US_ASCII));
++      String line;
++      while ((line = in.readLine()) != null) {
++        final String[] p = line.trim().split(" ", -1);
++        try {
++          if (p[0].equals("seals") && p.length == 6) {
++            final long chainId = Long.parseLong(p[1]);
++            final long h = Long.parseLong(p[2]);
++            final int r = Integer.parseInt(p[3]);
++            final byte[] hash = hex(p[4]);
++            final StringBuilder sb = new StringBuilder();
++            for (final String s : p[5].split(",", -1)) {
++              if (sb.length() > 0) {
++                sb.append(',');
++              }
++              sb.append(verify(hex(s), chainId, Falcon1024ConsensusCrypto.COMMIT_SEAL, h, r, hash));
++            }
++            out.println(sb);
++          } else if (p[0].equals("bind") && p.length == 4) {
++            out.println(
++                verify(
++                    hex(p[3]),
++                    Long.parseLong(p[1]),
++                    Falcon1024ConsensusCrypto.PQ_BINDING,
++                    0,
++                    0,
++                    hex(p[2])));
++          } else {
++            out.println("ERR usage");
++          }
++        } catch (final RuntimeException e) {
++          out.println("ERR " + e.getClass().getSimpleName());
++        }
++        out.flush();
++      }
++      return;
++    }
++    System.err.println("usage: bind-sign <falconKeyFile> <chainId> <hash32hex> | serve");
++    System.exit(2);
++  }
++}
+diff --git a/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
+index fbc0d21..d51be53 100644
+--- a/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
++++ b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
+@@ -83,9 +83,44 @@ class Falcon1024ConsensusCryptoTest {
+   void rejectsMalformedSigningDomain() {
+     assertThatThrownBy(() -> Falcon1024ConsensusCrypto.signingBytes(0, 1, 1, 0, new byte[32]))
+         .isInstanceOf(IllegalArgumentException.class);
+-    assertThatThrownBy(() -> Falcon1024ConsensusCrypto.signingBytes(9127, 6, 1, 0, new byte[32]))
++    assertThatThrownBy(() -> Falcon1024ConsensusCrypto.signingBytes(9127, 7, 1, 0, new byte[32]))
+         .isInstanceOf(IllegalArgumentException.class);
+     assertThatThrownBy(() -> Falcon1024ConsensusCrypto.signingBytes(9127, 1, 1, 0, new byte[31]))
+         .isInstanceOf(IllegalArgumentException.class);
+   }
++
++  @Test
++  void pqBindingEnvelopeIsNeverAcceptedAsConsensusSeal() {
++    final java.security.SecureRandom rnd = SecureRandomProvider.createSecureRandom();
++    final org.bouncycastle.crypto.AsymmetricCipherKeyPair kp =
++        Falcon1024ConsensusCrypto.generateKeyPair(rnd);
++    final org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters pub =
++        (org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters) kp.getPublic();
++    final byte[] hash = new byte[32];
++    hash[0] = 7;
++    final byte[] env =
++        Falcon1024ConsensusEnvelope.signAndEncode(
++            (org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters) kp.getPrivate(),
++            pub,
++            rnd,
++            912701,
++            Falcon1024ConsensusCrypto.PQ_BINDING,
++            0,
++            0,
++            hash);
++    final java.util.List<byte[]> allowed = java.util.List.of(pub.getH());
++    org.assertj.core.api.Assertions.assertThat(
++            Falcon1024ConsensusEnvelope.decodeAndVerify(
++                    env, 912701, Falcon1024ConsensusCrypto.PQ_BINDING, hash, allowed)
++                .round())
++        .isZero();
++    for (int t = Falcon1024ConsensusCrypto.PROPOSAL;
++        t <= Falcon1024ConsensusCrypto.COMMIT_SEAL;
++        t++) {
++      final int type = t;
++      assertThatThrownBy(
++              () -> Falcon1024ConsensusEnvelope.decodeAndVerify(env, 912701, type, hash, allowed))
++          .isInstanceOf(IllegalArgumentException.class);
++    }
++  }
+ }
+diff --git a/zeronyth/README-falcon-qbft.md b/zeronyth/README-falcon-qbft.md
+new file mode 100644
+index 0000000..c0ca323
+--- /dev/null
++++ b/zeronyth/README-falcon-qbft.md
+@@ -0,0 +1,39 @@
++# ZERONYTH Falcon-1024 QBFT (experimental) — status and rollout plan
++
++Branch `zeronyth-falcon-qbft` on Besu 26.9.0. Falcon mode is enabled only by the genesis flag `qbft.falcon1024: true`.
++When the flag is off, upstream ECDSA QBFT behaviour is unchanged. EVM transaction signing (secp256k1) and devp2p stay
++unchanged. The experimental chain is 912701, not 9127. Production was not touched.
++
++## Design
++- Consensus messages (PROPOSAL, PREPARE, COMMIT, ROUND_CHANGE) and COMMIT seals are signed as "ZQBF" v1 Falcon-1024 envelopes.
++  - Each envelope is bound to the domain, chainId, message type, height, round and payload hash. Validator address = keccak(falconPub)[12..].
++  - Size: pubkey 1792 B, signature ~1270 B, ~3.1 KB per envelope. extraData with 3 seals is ~9.5 KB.
++- ML-DSA-65 finality is kept. It uses the same certificate format as `scripts/pq-finality.mjs` (`ZERONYTH-PQ-FINALITY-v1`).
++  The attester `falcon-net/tools/pq-finality-falcon.mjs` verifies Falcon seals with the Java helper `Falcon1024PqTool`.
++  It binds each ML-DSA key to its Falcon validator with a Falcon `PQ_BINDING` (type 6) envelope plus an ML-DSA signature.
++  The old ECDSA binding is not used.
++
++## Rollout plan for production chain 9127 (NOT executed)
++Chain 9127 cannot be hot-swapped. Its ECDSA-sealed history and validator addresses (from secp256k1 keys) would be rejected
++by Falcon-mode nodes, and Falcon blocks would be rejected by today's nodes. Mixing the two modes forks the network. Options:
++1. **New chain (recommended first).** Launch a new chain ID with a Falcon genesis and migrate state/apps, or bridge.
++   9127 keeps running as it is.
++2. **Hard fork at block N on 9127.** This needs new code (not implemented): a fork-scheduled switch, so that blocks < N
++   are verified with ECDSA and blocks >= N with Falcon. Block N-1 or N must also carry a validator-set transition to the
++   Falcon addresses. Every validator must upgrade before N, and the light client and pq-finality need dual-mode verification.
++Mandatory steps before touching 9127:
++- Full backup of every node's data dir and keys, with a restore test.
++- Rehearsal on a copy of the chain.
++- An exact change list.
++- **Explicit owner approval.**
++- A rollback plan: stop at N-1 and restore.
++- Generate the Falcon keys on each validator host. Never copy production keys elsewhere.
++- Encrypt the Falcon key file. Today it is unencrypted (0600).
++
++## Known limits / tech debt
++- bcprov 1.84 Falcon is round-3 Falcon, not final FIPS 206 FN-DSA. Re-key is needed when FN-DSA is final.
++- `Falcon1024Signature` is carried through the `SECPSignature` type. The mode is a static process-wide switch.
++- In Falcon mode, consensus messages are broadcast to all peers.
++- Validator voting (add/remove) in Falcon mode has not been tested.
++- The browser light client cannot verify Falcon seals. There is no JS Falcon verifier.
++- QBFT recovery from below-quorum is slow because of exponential round backoff. This is upstream behaviour, but there is no ECDSA baseline to compare against yet.
+diff --git a/zeronyth/falcon-net/falcon-addresses.txt b/zeronyth/falcon-net/falcon-addresses.txt
+new file mode 100644
+index 0000000..4eaa449
+--- /dev/null
++++ b/zeronyth/falcon-net/falcon-addresses.txt
+@@ -0,0 +1,4 @@
++node1 address=0xdd3af24b8d11912f220e54bdba489cd66c7e5ef7
++node2 address=0x98a627d879aa10ea851eff5d9afc7412bc0148a0
++node3 address=0xbcc10aa6499844be3909b962b630e4acbe951b32
++node4 address=0x5b2bb078be5e96f86862a094cc8fd4dccf389f84
+diff --git a/zeronyth/falcon-net/genesis-falcon-912701.json b/zeronyth/falcon-net/genesis-falcon-912701.json
+new file mode 100644
+index 0000000..2b2ad1e
+--- /dev/null
++++ b/zeronyth/falcon-net/genesis-falcon-912701.json
+@@ -0,0 +1,27 @@
++{
++ "config": {
++  "chainId": 912701,
++  "berlinBlock": 0,
++  "londonBlock": 0,
++  "shanghaiTime": 0,
++  "zeroBaseFee": true,
++  "qbft": {
++   "blockperiodseconds": 1,
++   "epochlength": 30000,
++   "requesttimeoutseconds": 2,
++   "falcon1024": true
++  }
++ },
++ "nonce": "0x0",
++ "timestamp": "0x0",
++ "gasLimit": "0x1c9c380",
++ "difficulty": "0x1",
++ "mixHash": "0x63746963616c2062797a616e74696e65206661756c7420746f6c6572616e6365",
++ "coinbase": "0x0000000000000000000000000000000000000000",
++ "alloc": {
++  "c9ef574214bc3c6645b0532cebfd35c00fdf9aa9": {
++   "balance": "0x33b2e3c9fd0803ce8000000"
++  }
++ },
++ "extraData": "0xf87aa00000000000000000000000000000000000000000000000000000000000000000f85494dd3af24b8d11912f220e54bdba489cd66c7e5ef79498a627d879aa10ea851eff5d9afc7412bc0148a094bcc10aa6499844be3909b962b630e4acbe951b32945b2bb078be5e96f86862a094cc8fd4dccf389f84c080c0"
++}
+\ No newline at end of file
+diff --git a/zeronyth/falcon-net/start-node.sh b/zeronyth/falcon-net/start-node.sh
+new file mode 100755
+index 0000000..add0c7e
+--- /dev/null
++++ b/zeronyth/falcon-net/start-node.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++##
++## Copyright contributors to Besu.
++##
++## Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++## the License. You may obtain a copy of the License at
++##
++## http://www.apache.org/licenses/LICENSE-2.0
++##
++## Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++## an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++## specific language governing permissions and limitations under the License.
++##
++## SPDX-License-Identifier: Apache-2.0
++##
++
++# usage: start-node.sh <i>   (experimental Falcon-only QBFT, chainId 912701; loopback only)
++i=$1; N=/workspace/falcon-qbft/net; source /workspace/falcon-qbft/env.sh
++export PATH=$JAVA_HOME/bin:$PATH BESU_OPTS="-Xmx768m -XX:+UseG1GC"
++mkdir -p $N/logs
++nohup /workspace/falcon-qbft/besu/build/install/besu/bin/besu \
++  --genesis-file=$N/genesis-falcon-912701.json --network-id=912701 \
++  --data-path=$N/node$i/data --static-nodes-file=$N/node$i/static-nodes.json \
++  --discovery-enabled=false --nat-method=NONE \
++  --p2p-host=127.0.0.1 --p2p-port=$((31300+i)) \
++  --rpc-http-enabled --rpc-http-host=127.0.0.1 --rpc-http-port=$((18600+i)) \
++  --rpc-http-api=ETH,NET,QBFT,ADMIN,TXPOOL,WEB3 --host-allowlist=localhost,127.0.0.1 \
++  --min-gas-price=0 --sync-mode=FULL --tx-pool-max-future-by-sender=5000 \
++  >> $N/logs/node$i.log 2>&1 &
++echo $! > $N/node$i.pid
++echo "node$i pid $(cat $N/node$i.pid) p2p $((31300+i)) rpc $((18600+i))"
+diff --git a/zeronyth/falcon-net/tools/heights.sh b/zeronyth/falcon-net/tools/heights.sh
+new file mode 100755
+index 0000000..ecfc76a
+--- /dev/null
++++ b/zeronyth/falcon-net/tools/heights.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++##
++## Copyright contributors to Besu.
++##
++## Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
++## the License. You may obtain a copy of the License at
++##
++## http://www.apache.org/licenses/LICENSE-2.0
++##
++## Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
++## an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
++## specific language governing permissions and limitations under the License.
++##
++## SPDX-License-Identifier: Apache-2.0
++##
++
++# prints block height of each node (or "down")
++out="$(date +%H:%M:%S)"
++for i in 1 2 3 4; do
++ h=$(curl -s -m 2 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 127.0.0.1:$((18600+i)) | python3 -c "import json,sys;print(int(json.load(sys.stdin)['result'],16))" 2>/dev/null || echo down)
++ out="$out n$i=$h"
++done
++echo "$out"
+diff --git a/zeronyth/falcon-net/tools/loadgen.mjs b/zeronyth/falcon-net/tools/loadgen.mjs
+new file mode 100644
+index 0000000..89b81ca
+--- /dev/null
++++ b/zeronyth/falcon-net/tools/loadgen.mjs
+@@ -0,0 +1,70 @@
++// Load generator for the experimental Falcon-QBFT chain (912701). Wallet txs stay secp256k1 ECDSA (EIP-155 legacy).
++// usage: node loadgen.mjs <senderKeyFile> <totalTx> <senders> [rpcPorts=18601,18602,18603,18604]
++import { readFileSync } from 'node:fs';
++import { keccak_256, secp256k1 } from './vendor/vendor-noble.mjs';
++import { rlpEncode, hexToBytes, bytesToHex } from './vendor/light-client.mjs';
++const CHAIN_ID = 912701n;
++const [keyFile, totalS, sendersS, portsS] = process.argv.slice(2);
++const TOTAL = Number(totalS || 5000), S = Number(sendersS || 8);
++const PORTS = (portsS || '18601,18602,18603,18604').split(',').map(Number);
++const big = (n) => { n = BigInt(n); if (n === 0n) return new Uint8Array(0); let h = n.toString(16); if (h.length % 2) h = '0' + h; return hexToBytes(h); };
++const addrOf = (priv) => bytesToHex(keccak_256(secp256k1.getPublicKey(priv, false).subarray(1)).subarray(12));
++function signTx(priv, nonce, to, value) {
++  const base = [big(nonce), big(0), big(21000), hexToBytes(to), big(value), new Uint8Array(0)];
++  const h = keccak_256(rlpEncode([...base, big(CHAIN_ID), big(0), big(0)]));
++  const sig = secp256k1.sign(h, priv);
++  return bytesToHex(rlpEncode([...base, big(CHAIN_ID * 2n + 35n + BigInt(sig.recovery)), big(sig.r), big(sig.s)]));
++}
++let id = 1;
++async function rpc(port, method, params) {
++  const r = await fetch(`http://127.0.0.1:${port}/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: id++, method, params }) });
++  const j = await r.json(); if (j.error) throw new Error(method + ': ' + j.error.message); return j.result;
++}
++async function batch(port, raws) {
++  const body = raws.map((raw) => ({ jsonrpc: '2.0', id: id++, method: 'eth_sendRawTransaction', params: [raw] }));
++  const r = await fetch(`http://127.0.0.1:${port}/`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
++  const j = await r.json(); return j.filter((x) => x.error).map((x) => x.error.message);
++}
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const funder = hexToBytes(readFileSync(keyFile, 'utf8').trim());
++const funderAddr = addrOf(funder);
++// deterministic throwaway sub-accounts derived from the funder key (test only)
++const subs = Array.from({ length: S }, (_, i) => keccak_256(new Uint8Array([...funder, i])));
++let fNonce = BigInt(await rpc(PORTS[0], 'eth_getTransactionCount', [funderAddr, 'pending']));
++const fundRaws = subs.map((k) => signTx(funder, fNonce++, addrOf(k), 10n ** 21n));
++const fe = await batch(PORTS[0], fundRaws); if (fe.length) console.log('fund errors', fe.slice(0, 3));
++for (;;) { const bal = BigInt(await rpc(PORTS[0], 'eth_getBalance', [addrOf(subs[S - 1]), 'latest'])); if (bal > 0n) break; await sleep(300); }
++const startBlock = parseInt(await rpc(PORTS[0], 'eth_blockNumber', []), 16);
++// pre-sign everything so signing cost is not part of the measured window
++const per = Math.ceil(TOTAL / S); const raws = []; const startNonce = [];
++for (let s = 0; s < S; s++) {
++  let n = BigInt(await rpc(PORTS[0], 'eth_getTransactionCount', [addrOf(subs[s]), 'pending'])); startNonce.push(Number(n));
++  for (let k = 0; k < per && raws.length < TOTAL; k++) raws.push({ s, raw: signTx(subs[s], n++, funderAddr, 1n) });
++}
++const t0 = Date.now(); let errs = [];
++// each sender's txs go to one node (keeps nonce order), senders spread across nodes; batches of 200
++await Promise.all(Array.from({ length: S }, async (_, s) => {
++  const mine = raws.filter((x) => x.s === s).map((x) => x.raw); const port = PORTS[s % PORTS.length];
++  for (let i = 0; i < mine.length; i += 200) errs = errs.concat(await batch(port, mine.slice(i, i + 200)));
++}));
++const tSubmit = Date.now() - t0;
++// wait until all included
++const last = subs.map((k) => addrOf(k));
++for (;;) {
++  const counts = await Promise.all(last.map((a) => rpc(PORTS[0], 'eth_getTransactionCount', [a, 'latest'])));
++  const done = counts.reduce((a, c, i) => a + parseInt(c, 16) - startNonce[i], 0);
++  if (done >= raws.length || Date.now() - t0 > 600000) break; await sleep(250);
++}
++const tDone = Date.now() - t0;
++const endBlock = parseInt(await rpc(PORTS[0], 'eth_blockNumber', []), 16);
++let first = null, lastB = null, txs = 0, maxTx = 0; const perBlock = [];
++for (let b = startBlock + 1; b <= endBlock; b++) {
++  const blk = await rpc(PORTS[0], 'eth_getBlockByNumber', ['0x' + b.toString(16), false]);
++  const n = blk.transactions.length; perBlock.push(n);
++  if (n > 0) { if (first === null) first = blk; lastB = blk; txs += n; maxTx = Math.max(maxTx, n); }
++}
++const span = first ? (parseInt(lastB.timestamp, 16) - parseInt(first.timestamp, 16) + 1) : 0;
++console.log(JSON.stringify({ submitted: raws.length, submitErrors: errs.length, sampleErrors: [...new Set(errs)].slice(0, 3), senders: S,
++  submitMs: tSubmit, allIncludedMs: tDone, blocks: [startBlock + 1, endBlock], includedTx: txs,
++  firstTxBlock: first && parseInt(first.number, 16), lastTxBlock: lastB && parseInt(lastB.number, 16), blockTimestampSpanS: span,
++  tpsByBlockTimestamps: span ? +(txs / span).toFixed(1) : 0, tpsWallClock: +(txs / (tDone / 1000)).toFixed(1), maxTxPerBlock: maxTx, perBlock: perBlock.join(',') }));
+diff --git a/zeronyth/falcon-net/tools/pq-finality-falcon.mjs b/zeronyth/falcon-net/tools/pq-finality-falcon.mjs
+new file mode 100644
+index 0000000..9ca0cfb
+--- /dev/null
++++ b/zeronyth/falcon-net/tools/pq-finality-falcon.mjs
+@@ -0,0 +1,158 @@
++// ZERONYTH PQ finality attester for the EXPERIMENTAL Falcon-1024 QBFT chain (never 9127).
++// Same ML-DSA-65 certificate format as scripts/pq-finality.mjs, but (1) committed seals are
++// Falcon-1024 ZQBF envelopes verified by the Java helper Falcon1024PqTool, and (2) each ML-DSA key is
++// bound to its Falcon validator address with a Falcon PQ_BINDING envelope + ML-DSA signature.
++// Secrets: ML-DSA seeds (0600) in net/nodeN/data/pq-mldsa65.seed; never logged or served.
++import http from 'node:http';
++import { existsSync } from 'node:fs';
++import { readFile, writeFile, appendFile, mkdir, chmod } from 'node:fs/promises';
++import { randomBytes } from 'node:crypto';
++import { spawn, execFileSync } from 'node:child_process';
++import { createInterface } from 'node:readline';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { decodeExtra, qbftBlockHash, qbftSealHash, quorumSize, validatorSetHash, hexToBytes, bytesToHex } from './vendor/light-client.mjs';
++import { ml_dsa65, SCHEME, b64, finalityMessage, pqSetHash, bindingHash, verifyCertificate, pqQuorum } from './vendor/pq-finality-core.mjs';
++
++const net = fileURLToPath(new URL('../', import.meta.url));
++const RPC = process.env.RPC_URL || 'http://127.0.0.1:18601/';
++const PORT = Number(process.env.PORT || 18799);
++const CHAIN_ID = Number(process.env.CHAIN_ID || 912701);
++if (CHAIN_ID === 9127 || PORT === 8799 || /:8545\b/.test(RPC)) throw new Error('refusing to touch production chain/ports');
++const N = 4;
++const CP = process.env.FALCON_TOOL_CP || [process.env.ALG_JAR, path.join(net, '../besu/build/install/besu/lib/*')].filter(Boolean).join(':');
++const JAVA = process.env.JAVA || 'java';
++const outDir = path.join(net, 'pq');
++const log = (m) => process.stdout.write(`[PQ-FALCON] ${new Date().toISOString()} ${m}\n`);
++
++// ---- Java Falcon helper (long-running, line protocol) ----
++const helper = spawn(JAVA, ['-cp', CP, 'org.hyperledger.besu.crypto.Falcon1024PqTool', 'serve'], { stdio: ['pipe', 'pipe', 'inherit'] });
++const waiting = []; createInterface({ input: helper.stdout }).on('line', (l) => waiting.shift()?.(l));
++const ask = (line) => new Promise((res) => { waiting.push(res); helper.stdin.write(line + '\n'); });
++const h32 = (u8) => bytesToHex(u8).slice(2);
++
++async function verifyFalconHeader(block, trusted, parent) {
++  const e = decodeExtra(block.extraData);
++  const hash = qbftBlockHash(block, e);
++  if (hash.toLowerCase() !== block.hash.toLowerCase()) throw new Error(`header hash mismatch at ${parseInt(block.number, 16)}`);
++  if (parent && parent.hash.toLowerCase() !== block.parentHash.toLowerCase()) throw new Error('parentHash does not link to verified parent');
++  if (!e.seals.length) throw new Error('no seals');
++  const number = parseInt(block.number, 16);
++  const reply = await ask(`seals ${CHAIN_ID} ${number} ${e.roundNumber} ${h32(qbftSealHash(block, e))} ${e.seals.map(h32).join(',')}`);
++  const set = new Set(trusted.map((a) => a.toLowerCase())), signers = new Set();
++  for (const a of reply.split(',')) {
++    if (a === 'x' || a.startsWith('ERR')) throw new Error(`invalid Falcon seal at ${number}`);
++    if (!set.has(a)) throw new Error(`seal from non-validator ${a}`);
++    signers.add(a);
++  }
++  const need = quorumSize(set.size);
++  if (signers.size < need) throw new Error(`insufficient seals ${signers.size}/${need}`);
++  return { number, hash, signers: [...signers], need, nextValidators: e.validators, round: e.roundNumber };
++}
++
++async function loadKeys() {
++  const signers = [], entries = [];
++  for (let i = 1; i <= N; i++) {
++    const dir = path.join(net, `node${i}/data`);
++    const seedFile = path.join(dir, 'pq-mldsa65.seed');
++    if (!existsSync(seedFile)) { await writeFile(seedFile, randomBytes(32), { mode: 0o600 }); log(`generated ML-DSA-65 key for node${i} (0600)`); }
++    await chmod(seedFile, 0o600);
++    const kp = ml_dsa65.keygen(new Uint8Array(await readFile(seedFile)));
++    const fal = path.join(dir, 'falcon1024.key');
++    // Address placeholder resolved via the Falcon binding itself (address = keccak(falconPub)[12..]).
++    const address = (await readFile(path.join(net, 'falcon-addresses.txt'), 'utf8')).match(new RegExp(`node${i}\\s+(?:address=)?(0x[0-9a-f]{40})`))[1];
++    const h = bindingHash(address, kp.publicKey);
++    const falconBinding = execFileSync(JAVA, ['-cp', CP, 'org.hyperledger.besu.crypto.Falcon1024PqTool', 'bind-sign', fal, String(CHAIN_ID), h32(h)], { encoding: 'utf8' }).trim();
++    entries.push({ index: i - 1, node: `node${i}`, address, publicKey: b64.enc(kp.publicKey), falconBinding, pqBinding: b64.enc(ml_dsa65.sign(h, kp.secretKey)) });
++    signers.push(kp.secretKey);
++  }
++  const reg = { scheme: SCHEME, consensusScheme: 'FALCON-1024-QBFT-ZQBFv1', chainId: CHAIN_ID, epoch: 0, quorum: pqQuorum(N), validators: entries };
++  reg.setHash = pqSetHash(entries.map((e) => e.publicKey));
++  return { signers, reg };
++}
++async function verifyRegistryFalcon(reg, validators) {
++  const allowed = new Set(validators.map((a) => a.toLowerCase()));
++  for (const v of reg.validators) {
++    const pk = b64.dec(v.publicKey);
++    if (pk.length !== 1952) throw new Error('bad ML-DSA-65 public key length');
++    const h = bindingHash(v.address, pk);
++    if ((await ask(`bind ${reg.chainId} ${h32(h)} ${v.falconBinding}`)) !== v.address.toLowerCase()) throw new Error(`bad Falcon binding for ${v.address}`);
++    if (!ml_dsa65.verify(b64.dec(v.pqBinding), h, pk)) throw new Error(`bad ML-DSA binding for ${v.address}`);
++    if (!allowed.has(v.address.toLowerCase())) throw new Error(`PQ key for non-validator ${v.address}`);
++  }
++  if (pqSetHash(reg.validators.map((v) => v.publicKey)) !== reg.setHash) throw new Error('PQ set hash mismatch');
++}
++async function rpc(method, params = []) {
++  const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', method, params, id: 1 }), signal: AbortSignal.timeout(5000) });
++  const j = await r.json(); if (j.error) throw new Error(j.error.message); return j.result;
++}
++const getBlock = (n) => rpc('eth_getBlockByNumber', ['0x' + n.toString(16), false]);
++
++// ---- self-checks (negative tests) before serving ----
++async function selfCheck(trusted) {
++  const top = parseInt(await rpc('eth_blockNumber'), 16), b = await getBlock(top);
++  const res = {};
++  res.valid = (await verifyFalconHeader(b, trusted, null)).signers.length;
++  const e = decodeExtra(b.extraData), sh = h32(qbftSealHash(b, e));
++  const flip = (u8) => { const c = Uint8Array.from(u8); c[c.length - 5] ^= 1; return c; };
++  res.flippedSigRejected = (await ask(`seals ${CHAIN_ID} ${top} ${e.roundNumber} ${sh} ${h32(flip(e.seals[0]))}`)) === 'x';
++  res.wrongChainRejected = (await ask(`seals 9127 ${top} ${e.roundNumber} ${sh} ${h32(e.seals[0])}`)) === 'x';
++  res.wrongHeightRejected = (await ask(`seals ${CHAIN_ID} ${top + 1} ${e.roundNumber} ${sh} ${h32(e.seals[0])}`)) === 'x';
++  const prev = await getBlock(top - 1), pe = decodeExtra(prev.extraData);
++  res.sealReplayRejected = (await ask(`seals ${CHAIN_ID} ${top} ${e.roundNumber} ${sh} ${h32(pe.seals[0])}`)) === 'x';
++  try { await verifyFalconHeader({ ...b, gasUsed: '0x1' }, trusted, null); res.tamperedHeaderRejected = false; } catch { res.tamperedHeaderRejected = true; }
++  try { await verifyFalconHeader(b, trusted.slice(0, 1), null); res.nonValidatorRejected = false; } catch { res.nonValidatorRejected = true; }
++  return res;
++}
++
++const certs = new Map(); let latest = null, verifiedParent = null, trusted = null;
++const stats = { blocks: 0, failures: 0, lastError: '', falconVerifyMs: 0, signMsPerBlock: 0, verifyMsPerBlock: 0, certBytes: 0, startedAt: new Date().toISOString() };
++const ewma = (o, x) => (o ? o * 0.9 + x * 0.1 : x);
++async function certify(height, signers, reg) {
++  const block = await getBlock(height);
++  if (!trusted) trusted = decodeExtra((height > 0 ? await getBlock(height - 1) : block).extraData).validators;
++  let t = performance.now();
++  const h = await verifyFalconHeader(block, trusted, verifiedParent && verifiedParent.number === height - 1 ? verifiedParent : null);
++  stats.falconVerifyMs = ewma(stats.falconVerifyMs, performance.now() - t);
++  const cert = { scheme: SCHEME, chainId: CHAIN_ID, height, blockHash: block.hash.toLowerCase(), parentHash: block.parentHash.toLowerCase(), timestamp: parseInt(block.timestamp, 16),
++    validatorSetHash: validatorSetHash(h.nextValidators), pqSetHash: reg.setHash, falconSigners: h.signers.length, signatures: [] };
++  const msg = finalityMessage(cert);
++  t = performance.now();
++  for (const [index, sk] of signers.entries()) cert.signatures.push({ index, signature: b64.enc(ml_dsa65.sign(msg, sk)) });
++  stats.signMsPerBlock = ewma(stats.signMsPerBlock, performance.now() - t);
++  t = performance.now(); verifyCertificate(cert, reg); stats.verifyMsPerBlock = ewma(stats.verifyMsPerBlock, performance.now() - t);
++  trusted = h.nextValidators; verifiedParent = { number: height, hash: block.hash };
++  certs.set(height, cert); if (certs.size > 600) certs.delete(certs.keys().next().value);
++  latest = cert; stats.blocks++; stats.certBytes = JSON.stringify(cert).length;
++  if (height % 100 === 0) await appendFile(path.join(outDir, 'checkpoints.jsonl'), JSON.stringify(cert) + '\n');
++}
++
++await mkdir(outDir, { recursive: true });
++const { signers, reg } = await loadKeys();
++const genesisValidators = decodeExtra((await getBlock(0)).extraData).validators;
++await verifyRegistryFalcon(reg, genesisValidators);
++await writeFile(path.join(outDir, 'pq-validators-falcon.json'), JSON.stringify(reg, null, 2));
++log(`registry ok: ${N} ML-DSA-65 attesters bound to Falcon validators, quorum ${reg.quorum}, setHash ${reg.setHash}`);
++log(`self-check: ${JSON.stringify(await selfCheck(genesisValidators))}`);
++if (process.env.SELFCHECK_ONLY) { helper.stdin.end(); process.exit(0); }
++
++let next = null, busy = false;
++setInterval(async () => {
++  if (busy) return; busy = true;
++  try {
++    const top = parseInt(await rpc('eth_blockNumber'), 16);
++    if (next === null || top - next > 50) { next = Math.max(1, top - 5); trusted = null; verifiedParent = null; }
++    while (next <= top) { await certify(next, signers, reg); next++; }
++  } catch (e) { stats.failures++; stats.lastError = String(e.message).slice(0, 200); trusted = null; verifiedParent = null; }
++  finally { busy = false; }
++}, 200);
++setInterval(() => log(`stats ${JSON.stringify({ ...stats, latest: latest?.height })}`), 60000);
++const send = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
++http.createServer((req, res) => {
++  const u = new URL(req.url, 'http://x');
++  if (u.pathname === '/validators') return send(res, 200, reg);
++  if (u.pathname === '/stats') return send(res, 200, { ...stats, latest: latest && { height: latest.height, blockHash: latest.blockHash, signers: latest.signatures.length }, rssMB: Math.round(process.memoryUsage().rss / 1048576) });
++  const m = /^\/finality\/(latest|\d{1,12})$/.exec(u.pathname);
++  const c = m && (m[1] === 'latest' ? latest : certs.get(Number(m[1])));
++  return c ? send(res, 200, c) : send(res, 404, { error: 'not found' });
++}).listen(PORT, '127.0.0.1', () => log(`serving on 127.0.0.1:${PORT}`));
+diff --git a/zeronyth/falcon-net/validators.json b/zeronyth/falcon-net/validators.json
+new file mode 100644
+index 0000000..9fa0e48
+--- /dev/null
++++ b/zeronyth/falcon-net/validators.json
+@@ -0,0 +1 @@
++["0xdd3af24b8d11912f220e54bdba489cd66c7e5ef7", "0x98a627d879aa10ea851eff5d9afc7412bc0148a0", "0xbcc10aa6499844be3909b962b630e4acbe951b32", "0x5b2bb078be5e96f86862a094cc8fd4dccf389f84"]
+\ No newline at end of file
+-- 
+2.47.3
+

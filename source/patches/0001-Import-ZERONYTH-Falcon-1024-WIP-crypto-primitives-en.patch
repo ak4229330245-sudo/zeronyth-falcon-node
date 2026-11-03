@@ -1,0 +1,995 @@
+From 738001b0dcfd8dac54b56eee950a7a55dc08addd Mon Sep 17 00:00:00 2001
+From: ZERONYTH dev <dev@zeronyth.invalid>
+Date: Tue, 3 Nov 2026 08:01:52 +0900
+Subject: [PATCH 1/7] Import ZERONYTH Falcon-1024 WIP (crypto primitives,
+ envelope, quorum, payload authenticator)
+
+---
+ consensus/qbft-core/build.gradle              |   1 +
+ .../FalconQbftPayloadAuthenticator.java       | 101 ++++++++
+ .../besu/crypto/Falcon1024CommitQuorum.java   |  91 +++++++
+ .../crypto/Falcon1024ConsensusCrypto.java     | 113 +++++++++
+ .../crypto/Falcon1024ConsensusEnvelope.java   | 227 ++++++++++++++++++
+ .../Falcon1024ConsensusCryptoSelfTest.java    |  99 ++++++++
+ .../crypto/Falcon1024ConsensusCryptoTest.java |  86 +++++++
+ .../besu/crypto/Falcon1024QuorumSelfTest.java | 107 +++++++++
+ docs/zeronyth/FALCON1024_WIP_ZERONYTH.md      |  82 +++++++
+ 9 files changed, 907 insertions(+)
+ create mode 100644 consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/payload/FalconQbftPayloadAuthenticator.java
+ create mode 100644 crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java
+ create mode 100644 crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
+ create mode 100644 crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java
+ create mode 100644 crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java
+ create mode 100644 crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
+ create mode 100644 crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java
+ create mode 100644 docs/zeronyth/FALCON1024_WIP_ZERONYTH.md
+
+diff --git a/consensus/qbft-core/build.gradle b/consensus/qbft-core/build.gradle
+index 0fe8119..831d8a2 100644
+--- a/consensus/qbft-core/build.gradle
++++ b/consensus/qbft-core/build.gradle
+@@ -30,6 +30,7 @@ jar {
+ 
+ dependencies {
+   implementation project(':consensus:common')
++  implementation project(':crypto:algorithms')
+   implementation project(':crypto:services')
+   implementation project(':ethereum:core')
+   implementation project(':util')
+diff --git a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/payload/FalconQbftPayloadAuthenticator.java b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/payload/FalconQbftPayloadAuthenticator.java
+new file mode 100644
+index 0000000..3724281
+--- /dev/null
++++ b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/payload/FalconQbftPayloadAuthenticator.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.consensus.qbft.core.payload;
++
++import org.hyperledger.besu.consensus.common.bft.ConsensusRoundIdentifier;
++import org.hyperledger.besu.consensus.common.bft.payload.Payload;
++import org.hyperledger.besu.consensus.qbft.core.messagedata.QbftV1;
++import org.hyperledger.besu.crypto.Falcon1024ConsensusCrypto;
++import org.hyperledger.besu.crypto.Falcon1024ConsensusEnvelope;
++import org.hyperledger.besu.crypto.Falcon1024ConsensusEnvelope.VerifiedMessage;
++import org.hyperledger.besu.datatypes.Hash;
++
++import java.security.SecureRandom;
++import java.util.Collection;
++
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++
++/**
++ * Falcon-1024 authenticator for Besu's actual QBFT Payload objects.
++ *
++ * <p>All four native QBFT payload classes implement Payload. This adapter binds the existing
++ * canonical RLP payload hash to the new signed-envelope format. It is an integration building
++ * block, NOT YET plugged into Besu's MessageFactory, QbftMessageDecoder, or block-header seals.
++ * Those paths must all switch atomically on a separate experimental protocol version.
++ */
++public final class FalconQbftPayloadAuthenticator {
++  private FalconQbftPayloadAuthenticator() {}
++
++  public static byte[] sign(
++      final Payload payload,
++      final FalconPrivateKeyParameters secret,
++      final FalconPublicKeyParameters pub,
++      final SecureRandom random,
++      final long chainId) {
++    final ConsensusRoundIdentifier round = payload.getRoundIdentifier();
++    return Falcon1024ConsensusEnvelope.signAndEncode(
++        secret,
++        pub,
++        random,
++        chainId,
++        mapNativeMessageCode(payload.getMessageType()),
++        round.getSequenceNumber(),
++        round.getRoundNumber(),
++        payload.hashForSignature().getBytes().toArray());
++  }
++
++  public static VerifiedMessage verify(
++      final Payload decodedNativePayload,
++      final byte[] signedEnvelope,
++      final long expectedChainId,
++      final Collection<byte[]> allowedValidatorPublicKeys) {
++    final VerifiedMessage signed =
++        Falcon1024ConsensusEnvelope.decodeAndVerify(
++            signedEnvelope,
++            expectedChainId,
++            mapNativeMessageCode(decodedNativePayload.getMessageType()),
++            decodedNativePayload.hashForSignature().getBytes().toArray(),
++            allowedValidatorPublicKeys);
++    final ConsensusRoundIdentifier round = decodedNativePayload.getRoundIdentifier();
++    if (signed.blockHeight() != round.getSequenceNumber()
++        || signed.round() != round.getRoundNumber()) {
++      throw new IllegalArgumentException("Falcon envelope does not match native QBFT round");
++    }
++    return signed;
++  }
++
++  /**
++   * Commit seals are signed over Besu's actual committed-seal hash, distinct from COMMIT messages.
++   * Block-header serialization/verification must still be integrated separately.
++   */
++  public static byte[] signCommitSeal(
++      final Hash committedSealHash,
++      final ConsensusRoundIdentifier round,
++      final FalconPrivateKeyParameters secret,
++      final FalconPublicKeyParameters pub,
++      final SecureRandom random,
++      final long chainId) {
++    return Falcon1024ConsensusEnvelope.signAndEncode(
++        secret,
++        pub,
++        random,
++        chainId,
++        Falcon1024ConsensusCrypto.COMMIT_SEAL,
++        round.getSequenceNumber(),
++        round.getRoundNumber(),
++        committedSealHash.getBytes().toArray());
++  }
++
++  private static int mapNativeMessageCode(final int code) {
++    return switch (code) {
++      case QbftV1.PROPOSAL -> Falcon1024ConsensusCrypto.PROPOSAL;
++      case QbftV1.PREPARE -> Falcon1024ConsensusCrypto.PREPARE;
++      case QbftV1.COMMIT -> Falcon1024ConsensusCrypto.COMMIT;
++      case QbftV1.ROUND_CHANGE -> Falcon1024ConsensusCrypto.ROUND_CHANGE;
++      default -> throw new IllegalArgumentException("Unsupported native QBFT message type");
++    };
++  }
++}
+diff --git a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java
+new file mode 100644
+index 0000000..0d6682f
+--- /dev/null
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java
+@@ -0,0 +1,91 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Objects;
++import java.util.Set;
++
++/**
++ * Strict Falcon-1024 finality-seal quorum verification for a distinct experimental QBFT network.
++ *
++ * <p>This verifies validator signatures on an independently calculated committed-seal hash.
++ * It does not replace the consensus rules, block-header codec or the actual Besu commit validator.
++ * Do not feed it a hash supplied by an untrusted wire message without recomputing that hash.
++ */
++public final class Falcon1024CommitQuorum {
++  private Falcon1024CommitQuorum() {}
++
++  /** Minimum distinct validators required to finalize a QBFT block. */
++  public static int requiredSeals(final int validatorCount) {
++    if (validatorCount <= 0) {
++      throw new IllegalArgumentException("QBFT validator set cannot be empty");
++    }
++    return (int) ((2L * validatorCount) / 3L + 1L);
++  }
++
++  /**
++   * Fail-closed quorum verification. Every supplied seal must be authentic, authorized, unique,
++   * and scoped to exactly the expected chain, block and round. Duplicate/foreign seals cannot
++   * contribute to a quorum, even when they are presented alongside valid seals.
++   */
++  public static boolean verify(
++      final Collection<byte[]> seals,
++      final Collection<byte[]> authorizedValidatorKeys,
++      final long expectedChainId,
++      final long expectedBlockHeight,
++      final int expectedRound,
++      final byte[] independentlyComputedCommittedSealHash) {
++    Objects.requireNonNull(seals, "seals");
++    Objects.requireNonNull(authorizedValidatorKeys, "authorizedValidatorKeys");
++    Objects.requireNonNull(independentlyComputedCommittedSealHash, "committedSealHash");
++    if (independentlyComputedCommittedSealHash.length != 32 || expectedChainId <= 0
++        || expectedBlockHeight < 0 || expectedRound < 0) {
++      throw new IllegalArgumentException("Invalid expected finality context");
++    }
++
++    // Reject duplicate validator keys, including bytewise equal keys in distinct arrays.
++    final Set<ByteBuffer> seenKeys = new HashSet<>();
++    final Set<ByteBuffer> seenAddresses = new HashSet<>();
++    final List<byte[]> allowlist = new ArrayList<>();
++    for (final byte[] key : authorizedValidatorKeys) {
++      if (key == null || key.length != 1792
++          || !seenKeys.add(ByteBuffer.wrap(key))
++          || !seenAddresses.add(ByteBuffer.wrap(Falcon1024ConsensusEnvelope.validatorAddress(key)))) {
++        throw new IllegalArgumentException("Invalid or duplicate Falcon validator identity");
++      }
++      allowlist.add(key.clone());
++    }
++    final int required = requiredSeals(allowlist.size());
++    if (seals.size() < required || seals.size() > allowlist.size()) {
++      return false;
++    }
++
++    final Set<ByteBuffer> verifiedAuthors = new HashSet<>();
++    for (final byte[] seal : seals) {
++      try {
++        final Falcon1024ConsensusEnvelope.VerifiedMessage verified =
++            Falcon1024ConsensusEnvelope.decodeAndVerify(
++                seal,
++                expectedChainId,
++                Falcon1024ConsensusCrypto.COMMIT_SEAL,
++                independentlyComputedCommittedSealHash,
++                allowlist);
++        if (verified.blockHeight() != expectedBlockHeight
++            || verified.round() != expectedRound
++            || !verifiedAuthors.add(ByteBuffer.wrap(verified.authorAddress()))) {
++          return false;
++        }
++      } catch (final IllegalArgumentException invalidSeal) {
++        return false;
++      }
++    }
++    return verifiedAuthors.size() >= required;
++  }
++}
+diff --git a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
+new file mode 100644
+index 0000000..6f6e741
+--- /dev/null
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java
+@@ -0,0 +1,113 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.nio.ByteBuffer;
++import java.nio.charset.StandardCharsets;
++import java.security.SecureRandom;
++import java.util.Arrays;
++import java.util.Objects;
++
++import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
++import org.bouncycastle.crypto.params.ParametersWithRandom;
++import org.bouncycastle.pqc.crypto.falcon.FalconKeyGenerationParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconKeyPairGenerator;
++import org.bouncycastle.pqc.crypto.falcon.FalconParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconSigner;
++
++/**
++ * Experimental Falcon-1024 primitive for a future, versioned QBFT consensus protocol.
++ *
++ * <p>This does not replace the existing Besu ECDSA signature paths by itself. It deliberately
++ * domain-separates each consensus message from every other type, network and consensus round.
++ * Only a distinct Falcon-only network/protocol version may use this encoding.
++ */
++public final class Falcon1024ConsensusCrypto {
++
++  /** QBFT PROPOSAL. */
++  public static final int PROPOSAL = 1;
++  /** QBFT PREPARE. */
++  public static final int PREPARE = 2;
++  /** QBFT COMMIT. */
++  public static final int COMMIT = 3;
++  /** QBFT ROUND_CHANGE. */
++  public static final int ROUND_CHANGE = 4;
++  /** Block header finality/commit seal; never reuse the COMMIT message signature. */
++  public static final int COMMIT_SEAL = 5;
++
++  private static final byte[] DOMAIN =
++      "ZERONYTH/QBFT/FALCON-1024/V1\u0000".getBytes(StandardCharsets.US_ASCII);
++
++  private Falcon1024ConsensusCrypto() {}
++
++  /** Generates a new Falcon-1024 signing identity. Caller must securely persist its secret key. */
++  public static AsymmetricCipherKeyPair generateKeyPair(final SecureRandom random) {
++    Objects.requireNonNull(random, "random");
++    final FalconKeyPairGenerator generator = new FalconKeyPairGenerator();
++    generator.init(new FalconKeyGenerationParameters(random, FalconParameters.falcon_1024));
++    return generator.generateKeyPair();
++  }
++
++  /**
++   * Canonical signature input; never sign an unscoped block hash or raw message bytes.
++   *
++   * @param chainId genesis network's chain ID, not the p2p network ID
++   * @param messageType one of the five constants above
++   * @param blockHeight QBFT sequence (block height)
++   * @param round QBFT round, zero or greater
++   * @param payloadHash 32-byte canonical hash of the existing QBFT payload or header
++   */
++  public static byte[] signingBytes(
++      final long chainId,
++      final int messageType,
++      final long blockHeight,
++      final int round,
++      final byte[] payloadHash) {
++    if (chainId <= 0 || blockHeight < 0 || round < 0 || messageType < PROPOSAL
++        || messageType > COMMIT_SEAL) {
++      throw new IllegalArgumentException("Invalid consensus domain values");
++    }
++    Objects.requireNonNull(payloadHash, "payloadHash");
++    if (payloadHash.length != 32) {
++      throw new IllegalArgumentException("Expected 32-byte canonical payload hash");
++    }
++    final ByteBuffer result = ByteBuffer.allocate(DOMAIN.length + 8 + 4 + 8 + 4 + 32);
++    return result.put(DOMAIN)
++        .putLong(chainId)
++        .putInt(messageType)
++        .putLong(blockHeight)
++        .putInt(round)
++        .put(payloadHash)
++        .array();
++  }
++
++  /** Signs the canonical scoped QBFT preimage with Falcon-1024. */
++  public static byte[] sign(
++      final FalconPrivateKeyParameters privateKey,
++      final SecureRandom random,
++      final byte[] signingBytes) {
++    Objects.requireNonNull(privateKey, "privateKey");
++    Objects.requireNonNull(random, "random");
++    Objects.requireNonNull(signingBytes, "signingBytes");
++    final FalconSigner signer = new FalconSigner();
++    signer.init(true, new ParametersWithRandom(privateKey, random));
++    return signer.generateSignature(Arrays.copyOf(signingBytes, signingBytes.length));
++  }
++
++  /** Verifies the canonical scoped preimage against an already allowlisted public key. */
++  public static boolean verify(
++      final FalconPublicKeyParameters publicKey,
++      final byte[] signingBytes,
++      final byte[] signature) {
++    Objects.requireNonNull(publicKey, "publicKey");
++    Objects.requireNonNull(signingBytes, "signingBytes");
++    Objects.requireNonNull(signature, "signature");
++    final FalconSigner signer = new FalconSigner();
++    signer.init(false, publicKey);
++    return signer.verifySignature(Arrays.copyOf(signingBytes, signingBytes.length), signature);
++  }
++}
+diff --git a/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java
+new file mode 100644
+index 0000000..d04a9ed
+--- /dev/null
++++ b/crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java
+@@ -0,0 +1,227 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.nio.ByteBuffer;
++import java.security.MessageDigest;
++import java.security.SecureRandom;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Objects;
++
++import org.bouncycastle.crypto.digests.KeccakDigest;
++import org.bouncycastle.pqc.crypto.falcon.FalconParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++
++/**
++ * Versioned, strict Falcon-1024 consensus-authentication envelope.
++ *
++ * <p>This envelope authenticates the canonical hash of an actual QBFT payload; it does not
++ * encode the payload itself, nor implement QBFT transport/finality. Validators MUST recompute
++ * the payload hash and independently check block height, round, and 3-of-4 quorum. The
++ * authorized public-key registry MUST be anchored to the intended genesis/validator set.
++ *
++ * <p>Wire v1: magic(4), version(1), messageType(1), chainId(8), height(8), round(4),
++ * payloadHash(32), keySize(2), Falcon1024-key(1792), signatureSize(2), Falcon-signature.
++ * The encoder is intended exclusively for an explicitly versioned experimental QBFT network.
++ */
++public final class Falcon1024ConsensusEnvelope {
++  private static final byte[] MAGIC = {'Z', 'Q', 'B', 'F'};
++  private static final byte VERSION = 1;
++  private static final int HEADER_SIZE = MAGIC.length + 1 + 1 + 8 + 8 + 4 + 32 + 2;
++  private static final int PUBLIC_KEY_LENGTH = 1792;
++  private static final int MAX_SIGNATURE_LENGTH = 2048;
++
++  private Falcon1024ConsensusEnvelope() {}
++
++  /** Sign a QBFT message's canonical 32-byte payload or block-header hash. */
++  public static byte[] signAndEncode(
++      final FalconPrivateKeyParameters secret,
++      final FalconPublicKeyParameters pub,
++      final SecureRandom random,
++      final long chainId,
++      final int messageType,
++      final long blockHeight,
++      final int round,
++      final byte[] payloadHash) {
++    Objects.requireNonNull(pub, "pub");
++    Objects.requireNonNull(secret, "secret");
++    final byte[] publicKey = pub.getH();
++    if (publicKey.length != PUBLIC_KEY_LENGTH) {
++      throw new IllegalArgumentException("Expected Falcon-1024 public key");
++    }
++    final byte[] canonical =
++        Falcon1024ConsensusCrypto.signingBytes(
++            chainId, messageType, blockHeight, round, payloadHash);
++    final byte[] signature = Falcon1024ConsensusCrypto.sign(secret, random, canonical);
++    if (signature.length == 0 || signature.length > MAX_SIGNATURE_LENGTH) {
++      throw new IllegalStateException("Unexpected Falcon-1024 signature length");
++    }
++    // Do not permit a caller to pair an unrelated public key with a private key.
++    if (!Falcon1024ConsensusCrypto.verify(pub, canonical, signature)) {
++      throw new IllegalArgumentException("Falcon public/private key mismatch");
++    }
++    final ByteBuffer out = ByteBuffer.allocate(HEADER_SIZE + publicKey.length + 2 + signature.length);
++    out.put(MAGIC);
++    out.put(VERSION);
++    out.put((byte) messageType);
++    out.putLong(chainId);
++    out.putLong(blockHeight);
++    out.putInt(round);
++    out.put(payloadHash);
++    out.putShort((short) publicKey.length);
++    out.put(publicKey);
++    out.putShort((short) signature.length);
++    out.put(signature);
++    return out.array();
++  }
++
++  /**
++   * Decode, authorize the exact Falcon-1024 public key, and verify the real payload hash.
++   *
++   * @param expectedPayloadHash independently computed from the decoded QBFT payload/header
++   * @param allowedPublicKeys exact 1792-byte public keys of the genesis/active validators
++   * @throws IllegalArgumentException for all malformed or unauthorized messages
++   */
++  public static VerifiedMessage decodeAndVerify(
++      final byte[] wire,
++      final long expectedChainId,
++      final int expectedMessageType,
++      final byte[] expectedPayloadHash,
++      final Collection<byte[]> allowedPublicKeys) {
++    Objects.requireNonNull(wire, "wire");
++    Objects.requireNonNull(expectedPayloadHash, "expectedPayloadHash");
++    Objects.requireNonNull(allowedPublicKeys, "allowedPublicKeys");
++    if (wire.length < HEADER_SIZE + PUBLIC_KEY_LENGTH + 2 + 1
++        || wire.length > HEADER_SIZE + PUBLIC_KEY_LENGTH + 2 + MAX_SIGNATURE_LENGTH) {
++      throw new IllegalArgumentException("Invalid Falcon envelope size");
++    }
++
++    final ByteBuffer in = ByteBuffer.wrap(wire);
++    for (final byte b : MAGIC) {
++      if (in.get() != b) {
++        throw new IllegalArgumentException("Not a Falcon QBFT v1 envelope");
++      }
++    }
++    if (in.get() != VERSION) {
++      throw new IllegalArgumentException("Unsupported Falcon QBFT protocol version");
++    }
++    final int messageType = Byte.toUnsignedInt(in.get());
++    final long chainId = in.getLong();
++    final long blockHeight = in.getLong();
++    final int round = in.getInt();
++    final byte[] payloadHash = new byte[32];
++    in.get(payloadHash);
++    final int publicKeyLength = Short.toUnsignedInt(in.getShort());
++    if (publicKeyLength != PUBLIC_KEY_LENGTH || in.remaining() < PUBLIC_KEY_LENGTH + 2 + 1) {
++      throw new IllegalArgumentException("Invalid Falcon-1024 public key length");
++    }
++    final byte[] publicKey = new byte[PUBLIC_KEY_LENGTH];
++    in.get(publicKey);
++    final int signatureLength = Short.toUnsignedInt(in.getShort());
++    if (signatureLength == 0 || signatureLength > MAX_SIGNATURE_LENGTH
++        || signatureLength != in.remaining()) {
++      throw new IllegalArgumentException("Invalid Falcon-1024 signature length or trailing data");
++    }
++    final byte[] signature = new byte[signatureLength];
++    in.get(signature);
++
++    if (chainId != expectedChainId || messageType != expectedMessageType
++        || !MessageDigest.isEqual(payloadHash, expectedPayloadHash)) {
++      throw new IllegalArgumentException("Falcon QBFT message domain or payload mismatch");
++    }
++
++    boolean authorized = false;
++    for (final byte[] accepted : allowedPublicKeys) {
++      // Check exact key, not a self-asserted signer address.
++      if (accepted != null && accepted.length == PUBLIC_KEY_LENGTH) {
++        authorized |= MessageDigest.isEqual(publicKey, accepted);
++      }
++    }
++    if (!authorized) {
++      throw new IllegalArgumentException("Unknown Falcon QBFT validator key");
++    }
++    final FalconPublicKeyParameters publicKeyParameters =
++        new FalconPublicKeyParameters(FalconParameters.falcon_1024, publicKey);
++    final byte[] canonical;
++    try {
++      canonical = Falcon1024ConsensusCrypto.signingBytes(
++          chainId, messageType, blockHeight, round, payloadHash);
++      if (!Falcon1024ConsensusCrypto.verify(publicKeyParameters, canonical, signature)) {
++        throw new IllegalArgumentException("Invalid Falcon QBFT signature");
++      }
++    } catch (final RuntimeException malformedSignature) {
++      throw new IllegalArgumentException("Invalid Falcon QBFT signature/domain", malformedSignature);
++    }
++    return new VerifiedMessage(
++        messageType, chainId, blockHeight, round, validatorAddress(publicKey), payloadHash);
++  }
++
++  /**
++   * Derives a new validator address from its Falcon public key for a NEW experimental genesis.
++   * These addresses are not compatible with existing secp256k1 validator addresses.
++   */
++  public static byte[] validatorAddress(final byte[] publicKey) {
++    Objects.requireNonNull(publicKey, "publicKey");
++    if (publicKey.length != PUBLIC_KEY_LENGTH) {
++      throw new IllegalArgumentException("Expected Falcon-1024 raw public key");
++    }
++    final KeccakDigest hash = new KeccakDigest(256);
++    hash.update(publicKey, 0, publicKey.length);
++    final byte[] digest = new byte[32];
++    hash.doFinal(digest, 0);
++    return Arrays.copyOfRange(digest, 12, 32);
++  }
++
++  /** Proof of successful verification, not directly constructible by callers. */
++  public static final class VerifiedMessage {
++    private final int messageType;
++    private final long chainId;
++    private final long blockHeight;
++    private final int round;
++    private final byte[] authorAddress;
++    private final byte[] payloadHash;
++
++    private VerifiedMessage(
++        final int messageType,
++        final long chainId,
++        final long blockHeight,
++        final int round,
++        final byte[] authorAddress,
++        final byte[] payloadHash) {
++      this.messageType = messageType;
++      this.chainId = chainId;
++      this.blockHeight = blockHeight;
++      this.round = round;
++      this.authorAddress = authorAddress.clone();
++      this.payloadHash = payloadHash.clone();
++    }
++
++    public int messageType() {
++      return messageType;
++    }
++
++    public long chainId() {
++      return chainId;
++    }
++
++    public long blockHeight() {
++      return blockHeight;
++    }
++
++    public int round() {
++      return round;
++    }
++
++    public byte[] authorAddress() {
++      return authorAddress.clone();
++    }
++
++    public byte[] payloadHash() {
++      return payloadHash.clone();
++    }
++  }
++}
+diff --git a/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java
+new file mode 100644
+index 0000000..93de0c4
+--- /dev/null
++++ b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java
+@@ -0,0 +1,99 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.security.SecureRandom;
++import java.util.Arrays;
++import java.util.List;
++
++import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++
++/**
++ * Independent smoke test for the Falcon primitive (no Gradle/JUnit required).
++ * Only the real Besu protocol integration can establish end-to-end QBFT support.
++ */
++public final class Falcon1024ConsensusCryptoSelfTest {
++  private Falcon1024ConsensusCryptoSelfTest() {}
++
++  public static void main(final String[] args) {
++    final SecureRandom random = new SecureRandom();
++    final AsymmetricCipherKeyPair validator = Falcon1024ConsensusCrypto.generateKeyPair(random);
++    final FalconPrivateKeyParameters secret =
++        (FalconPrivateKeyParameters) validator.getPrivate();
++    final FalconPublicKeyParameters pub = (FalconPublicKeyParameters) validator.getPublic();
++    System.out.println("Falcon-1024 raw public-key bytes: " + pub.getH().length);
++    final FalconPublicKeyParameters outsider =
++        (FalconPublicKeyParameters) Falcon1024ConsensusCrypto.generateKeyPair(random).getPublic();
++    final byte[] hash = new byte[32];
++    random.nextBytes(hash);
++
++    for (int t = Falcon1024ConsensusCrypto.PROPOSAL;
++        t <= Falcon1024ConsensusCrypto.COMMIT_SEAL;
++        t++) {
++      final int type = t;
++      final byte[] canonical = Falcon1024ConsensusCrypto.signingBytes(9127, type, 313297, 0, hash);
++      final byte[] signature = Falcon1024ConsensusCrypto.sign(secret, random, canonical);
++      if (type == Falcon1024ConsensusCrypto.PROPOSAL) {
++        System.out.println("Falcon-1024 example signature bytes: " + signature.length);
++      }
++      check(Falcon1024ConsensusCrypto.verify(pub, canonical, signature), "authentic signature");
++      check(!Falcon1024ConsensusCrypto.verify(outsider, canonical, signature), "outsider key");
++      final byte[] corrupt = Arrays.copyOf(signature, signature.length);
++      corrupt[corrupt.length - 1] ^= 1;
++      check(!Falcon1024ConsensusCrypto.verify(pub, canonical, corrupt), "tampered signature");
++      final byte[] wrongChain = Falcon1024ConsensusCrypto.signingBytes(9128, type, 313297, 0, hash);
++      check(!Falcon1024ConsensusCrypto.verify(pub, wrongChain, signature), "cross-chain replay");
++      final byte[] wrongHeight = Falcon1024ConsensusCrypto.signingBytes(9127, type, 313298, 0, hash);
++      check(!Falcon1024ConsensusCrypto.verify(pub, wrongHeight, signature), "height replay");
++      final byte[] wrongRound = Falcon1024ConsensusCrypto.signingBytes(9127, type, 313297, 1, hash);
++      check(!Falcon1024ConsensusCrypto.verify(pub, wrongRound, signature), "round replay");
++      final int another = type == 5 ? 1 : type + 1;
++      final byte[] wrongType = Falcon1024ConsensusCrypto.signingBytes(9127, another, 313297, 0, hash);
++      check(!Falcon1024ConsensusCrypto.verify(pub, wrongType, signature), "message-type replay");
++      final byte[] envelope = Falcon1024ConsensusEnvelope.signAndEncode(
++          secret, pub, random, 9127, type, 313297, 0, hash);
++      final Falcon1024ConsensusEnvelope.VerifiedMessage decoded =
++          Falcon1024ConsensusEnvelope.decodeAndVerify(
++              envelope, 9127, type, hash, List.of(pub.getH()));
++      check(decoded.messageType() == type, "wire message type");
++      check(decoded.blockHeight() == 313297, "wire block height");
++      check(decoded.authorAddress().length == 20, "wire validator address");
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          envelope, 9128, type, hash, List.of(pub.getH())), "wire cross-chain replay");
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          envelope, 9127, another, hash, List.of(pub.getH())), "wire cross-message replay");
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          envelope, 9127, type, hash, List.of(outsider.getH())), "unauthorized signer");
++      final byte[] modifiedWire = envelope.clone();
++      modifiedWire[modifiedWire.length - 1] ^= 1;
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          modifiedWire, 9127, type, hash, List.of(pub.getH())), "wire signature forgery");
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          Arrays.copyOf(envelope, envelope.length - 1), 9127, type, hash,
++          List.of(pub.getH())), "truncated wire");
++      reject(() -> Falcon1024ConsensusEnvelope.decodeAndVerify(
++          Arrays.copyOf(envelope, envelope.length + 1), 9127, type, hash,
++          List.of(pub.getH())), "trailing byte");
++      System.out.println("PASS: Falcon-1024 consensus type " + type);
++    }
++  }
++
++  private static void check(final boolean good, final String name) {
++    if (!good) {
++      throw new AssertionError("FAILED: " + name);
++    }
++  }
++
++  private static void reject(final Runnable verification, final String name) {
++    try {
++      verification.run();
++    } catch (final IllegalArgumentException expected) {
++      return;
++    }
++    throw new AssertionError("FAILED: accepted " + name);
++  }
++}
+diff --git a/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
+new file mode 100644
+index 0000000..a60cc2e
+--- /dev/null
++++ b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java
+@@ -0,0 +1,86 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import java.security.SecureRandom;
++import java.util.Arrays;
++
++import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++import org.junit.jupiter.api.Test;
++
++class Falcon1024ConsensusCryptoTest {
++
++  @Test
++  void authenticFalcon1024RoundTripAndReplaySeparation() {
++    final SecureRandom random = new SecureRandom();
++    final AsymmetricCipherKeyPair validator = Falcon1024ConsensusCrypto.generateKeyPair(random);
++    final FalconPrivateKeyParameters secret =
++        (FalconPrivateKeyParameters) validator.getPrivate();
++    final FalconPublicKeyParameters publicKey =
++        (FalconPublicKeyParameters) validator.getPublic();
++    final byte[] payloadHash = new byte[32];
++    random.nextBytes(payloadHash);
++
++    for (int messageType = Falcon1024ConsensusCrypto.PROPOSAL;
++        messageType <= Falcon1024ConsensusCrypto.COMMIT_SEAL;
++        messageType++) {
++      final byte[] signingBytes =
++          Falcon1024ConsensusCrypto.signingBytes(9127, messageType, 123, 2, payloadHash);
++      final byte[] signature = Falcon1024ConsensusCrypto.sign(secret, random, signingBytes);
++      assertThat(Falcon1024ConsensusCrypto.verify(publicKey, signingBytes, signature)).isTrue();
++
++      final byte[] altered = Arrays.copyOf(signingBytes, signingBytes.length);
++      altered[altered.length - 1] ^= 1;
++      assertThat(Falcon1024ConsensusCrypto.verify(publicKey, altered, signature)).isFalse();
++      assertThat(
++              Falcon1024ConsensusCrypto.verify(
++                  publicKey,
++                  Falcon1024ConsensusCrypto.signingBytes(9128, messageType, 123, 2, payloadHash),
++                  signature))
++          .isFalse();
++      assertThat(
++              Falcon1024ConsensusCrypto.verify(
++                  publicKey,
++                  Falcon1024ConsensusCrypto.signingBytes(9127, messageType, 124, 2, payloadHash),
++                  signature))
++          .isFalse();
++      assertThat(
++              Falcon1024ConsensusCrypto.verify(
++                  publicKey,
++                  Falcon1024ConsensusCrypto.signingBytes(9127, messageType, 123, 3, payloadHash),
++                  signature))
++          .isFalse();
++      final int differentType =
++          messageType == Falcon1024ConsensusCrypto.COMMIT_SEAL
++              ? Falcon1024ConsensusCrypto.COMMIT
++              : messageType + 1;
++      assertThat(
++              Falcon1024ConsensusCrypto.verify(
++                  publicKey,
++                  Falcon1024ConsensusCrypto.signingBytes(
++                      9127, differentType, 123, 2, payloadHash),
++                  signature))
++          .isFalse();
++    }
++  }
++
++  @Test
++  void rejectsMalformedSigningDomain() {
++    assertThatThrownBy(
++            () -> Falcon1024ConsensusCrypto.signingBytes(0, 1, 1, 0, new byte[32]))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(
++            () -> Falcon1024ConsensusCrypto.signingBytes(9127, 6, 1, 0, new byte[32]))
++        .isInstanceOf(IllegalArgumentException.class);
++    assertThatThrownBy(
++            () -> Falcon1024ConsensusCrypto.signingBytes(9127, 1, 1, 0, new byte[31]))
++        .isInstanceOf(IllegalArgumentException.class);
++  }
++}
+diff --git a/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java
+new file mode 100644
+index 0000000..ff6342f
+--- /dev/null
++++ b/crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java
+@@ -0,0 +1,107 @@
++/*
++ * Copyright ZERONYTH Network contributors.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package org.hyperledger.besu.crypto;
++
++import java.security.SecureRandom;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
++import org.bouncycastle.pqc.crypto.falcon.FalconPrivateKeyParameters;
++import org.bouncycastle.pqc.crypto.falcon.FalconPublicKeyParameters;
++
++/**
++ * Simulated 3-of-4 Falcon-1024 signer/quorum smoke test, NOT a running Besu QBFT network.
++ */
++public final class Falcon1024QuorumSelfTest {
++  private Falcon1024QuorumSelfTest() {}
++
++  public static void main(final String[] args) {
++    final SecureRandom random = new SecureRandom();
++    final List<AsymmetricCipherKeyPair> validators = new ArrayList<>();
++    final List<byte[]> allowlist = new ArrayList<>();
++    for (int i = 0; i < 4; i++) {
++      final AsymmetricCipherKeyPair keyPair = Falcon1024ConsensusCrypto.generateKeyPair(random);
++      validators.add(keyPair);
++      allowlist.add(((FalconPublicKeyParameters) keyPair.getPublic()).getH());
++    }
++    final byte[] canonicalCommitHash = new byte[32];
++    random.nextBytes(canonicalCommitHash);
++
++    // Simulate one validator being down: the other three sign a unique commit seal.
++    final List<byte[]> seals = new ArrayList<>();
++    for (int i = 0; i < 3; i++) {
++      final AsymmetricCipherKeyPair kp = validators.get(i);
++      seals.add(Falcon1024ConsensusEnvelope.signAndEncode(
++          (FalconPrivateKeyParameters) kp.getPrivate(),
++          (FalconPublicKeyParameters) kp.getPublic(),
++          random,
++          9127,
++          Falcon1024ConsensusCrypto.COMMIT_SEAL,
++          313298,
++          0,
++          canonicalCommitHash));
++    }
++    require(quorum(seals, allowlist, canonicalCommitHash), "3-of-4 simulated quorum");
++    System.out.println("PASS: simulated Falcon-only 3-of-4 quorum (1 validator offline)");
++
++    // Two offline: honest 2-of-4 must not finalize.
++    require(!quorum(seals.subList(0, 2), allowlist, canonicalCommitHash), "2-of-4 rejected");
++    System.out.println("PASS: simulated 2-of-4 rejected");
++
++    // Duplicates never count toward a quorum, regardless of signature bytes.
++    final List<byte[]> duplicates = List.of(seals.get(0), seals.get(0), seals.get(1));
++    require(!quorum(duplicates, allowlist, canonicalCommitHash), "duplicate seals rejected");
++    System.out.println("PASS: duplicate validator seal cannot increase quorum");
++
++    // A nonmember's valid cryptographic signature must not count.
++    final AsymmetricCipherKeyPair outsider = Falcon1024ConsensusCrypto.generateKeyPair(random);
++    final byte[] outsiderSeal = Falcon1024ConsensusEnvelope.signAndEncode(
++        (FalconPrivateKeyParameters) outsider.getPrivate(),
++        (FalconPublicKeyParameters) outsider.getPublic(),
++        random,
++        9127,
++        Falcon1024ConsensusCrypto.COMMIT_SEAL,
++        313298,
++        0,
++        canonicalCommitHash);
++    require(!quorum(List.of(seals.get(0), seals.get(1), outsiderSeal), allowlist,
++        canonicalCommitHash), "outsider rejected");
++    System.out.println("PASS: nonmember signature rejected");
++
++    require(!Falcon1024CommitQuorum.verify(
++        seals, allowlist, 9127, 313299, 0, canonicalCommitHash),
++        "old-block replay rejected");
++    require(!Falcon1024CommitQuorum.verify(
++        seals, allowlist, 9127, 313298, 1, canonicalCommitHash),
++        "old-round replay rejected");
++    require(!Falcon1024CommitQuorum.verify(
++        seals, allowlist, 9128, 313298, 0, canonicalCommitHash),
++        "cross-chain replay rejected");
++    System.out.println("PASS: committed seals rejected on another height, round or chain");
++
++    try {
++      Falcon1024CommitQuorum.verify(
++          seals,
++          List.of(allowlist.get(0), allowlist.get(0), allowlist.get(1), allowlist.get(2)),
++          9127, 313298, 0, canonicalCommitHash);
++      throw new AssertionError("duplicate genesis validator keys accepted");
++    } catch (final IllegalArgumentException expected) {
++      System.out.println("PASS: duplicate validator public keys rejected at registry boundary");
++    }
++  }
++
++  private static boolean quorum(
++      final List<byte[]> seals, final List<byte[]> authorizedKeys, final byte[] commitHash) {
++    return Falcon1024CommitQuorum.verify(
++        seals, authorizedKeys, 9127, 313298, 0, commitHash);
++  }
++
++  private static void require(final boolean condition, final String message) {
++    if (!condition) {
++      throw new AssertionError("FAILED: " + message);
++    }
++  }
++}
+diff --git a/docs/zeronyth/FALCON1024_WIP_ZERONYTH.md b/docs/zeronyth/FALCON1024_WIP_ZERONYTH.md
+new file mode 100644
+index 0000000..7029d25
+--- /dev/null
++++ b/docs/zeronyth/FALCON1024_WIP_ZERONYTH.md
+@@ -0,0 +1,82 @@
++# ZERONYTH / Besu 26.9.0 — Falcon-1024 QBFT work-in-progress
++
++This is a **research fork patch**, not a completed Falcon-only QBFT client.
++
++## Verified in an isolated build
++
++- Temurin JDK 25.0.5+8; `bcprov-jdk18on` 1.84.
++- Bouncy Castle Falcon-1024 generation, signing and verification are real, not mocks.
++- Five separate domain-separated signature purposes: PROPOSAL, PREPARE, COMMIT,
++  ROUND_CHANGE and BLOCK COMMIT SEAL.
++- Signature context includes chain ID, height, round and 32-byte canonical payload digest.
++- A strict experimental wire envelope authenticates a recomputed payload hash using a
++  genesis/active-set allowlist of exact Falcon-1024 public keys; an arbitrary sender-supplied
++  key is insufficient.
++- Tests reject signature modification, unknown signer, wrong chain, wrong round,
++  wrong height, wrong message type, truncation and appended data.
++- `Falcon1024CommitQuorum` provides a reusable strict, fail-closed validator commit-seal
++  threshold check (`floor(2N/3)+1`) with exact chain, block, round and signer binding.
++- A **simulated** 4-key quorum test accepts 3/4 signatures, rejects 2/4,
++  rejects duplicates, unknown keys, cross-chain/block/round replay, and duplicate
++  public keys in the active validator registry. **These are not four Besu processes.**
++- `FalconQbftPayloadAuthenticator` converts **real native QBFT Payload** hashes
++  to/from the experimental Falcon envelope; it is not yet invoked in message networking.
++
++## Not implemented or verified yet
++
++1. `MessageFactory`/`QbftMessageDecoder` dispatch to Falcon-only v2 messages.
++2. `SignedData` and `BftMessage` native signed-message data flow using Falcon instead of
++   `SECPSignature` and secp256k1 sender recovery.
++3. Validator-set identity binding throughout proposer selection, address lookup and
++   dynamic validator membership. New experimental genesis keys are required; existing
++   ECDSA validator addresses are **not** interchangeable with Falcon-derived identities.
++4. `CommitPayload`, `QbftRound`, `RoundState`, `BftExtraData`, `QbftExtraDataCodec`,
++   `BftBlockHashing`, `CommitValidator` and header seal verification must carry and
++   validate Falcon commit seals, not `SECPSignature` objects.
++5. Fully rebuilding Besu 26.9.0, integration tests and four real Besu processes.
++6. Chaos tests, throughput, sync/restart and production VPS staging/deployment.
++
++**The live Chain ID 9127 network remains ECDSA-based QBFT with its independent ML-DSA-65
++proof layer. None of this work has been deployed to that chain.**
++
++Retain the separate ML-DSA-65 proof layer. EVM-wallet secp256k1 transaction signatures
++are a different trust boundary and should not be removed as part of QBFT authentication.
++
++## Changed/added files (relative to Besu 26.9.0)
++
++- `crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java`
++- `crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java`
++- `crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java`
++- `crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoTest.java`
++- `crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java`
++- `crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java`
++- `consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/payload/FalconQbftPayloadAuthenticator.java`
++- `consensus/qbft-core/build.gradle` (adds crypto:algorithms dependency)
++
++## Repeatable standalone cryptographic smoke tests
++
++With JDK 25 and an authorized `bcprov-jdk18on-1.84.jar` available locally:
++
++```bash
++BC_JAR=/path/to/bcprov-jdk18on-1.84.jar
++TEST_OUT=/path/to/build-output
++mkdir -p "$TEST_OUT"
++javac -cp "$BC_JAR" -d "$TEST_OUT" \
++  crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCrypto.java \
++  crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024ConsensusEnvelope.java \
++  crypto/algorithms/src/main/java/org/hyperledger/besu/crypto/Falcon1024CommitQuorum.java \
++  crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024ConsensusCryptoSelfTest.java \
++  crypto/algorithms/src/test/java/org/hyperledger/besu/crypto/Falcon1024QuorumSelfTest.java
++java -cp "$TEST_OUT:$BC_JAR" org.hyperledger.besu.crypto.Falcon1024ConsensusCryptoSelfTest
++java -cp "$TEST_OUT:$BC_JAR" org.hyperledger.besu.crypto.Falcon1024QuorumSelfTest
++```
++
++Besu's full Gradle build was attempted, but blocked by Gradle distribution DNS resolution;
++this patch has **not** passed a complete Besu build. The native QBFT adapter currently
++needs compile-time integration verification as well.
++
++Before deploying a Falcon-only experiment, allocate a **new genesis and network/protocol
++version**. Do not allow old ECDSA-based nodes to accept Falcon envelopes via implicit
++fallback or replace a live validator's key in place. Persist validator secret keys with
++encryption and restricted filesystem permissions. Audit cryptographic implementation and
++wire validation before use with anything of value.
+-- 
+2.47.3
+

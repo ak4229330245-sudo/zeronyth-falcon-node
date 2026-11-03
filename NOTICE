@@ -1,0 +1,5 @@
+This distribution contains a modified version of Hyperledger Besu (https://github.com/hyperledger/besu),
+Copyright contributors to Hyperledger Besu, licensed under the Apache License 2.0 (besu/LICENSE).
+Modifications (Falcon-1024 QBFT consensus, encrypted Falcon key files, tooling) by ZERONYTH, 2026,
+also under Apache-2.0; see source/patches/. Falcon-1024 is provided by the Legion of the Bouncy Castle
+library (bcprov-jdk18on 1.84, MIT-style license) and is the NIST round-3 Falcon, NOT FIPS 206 FN-DSA.

@@ -1,0 +1,7 @@
+besu/
+*.tar.gz
+*.key
+*.pass
+.env*
+secrets/
+data/

@@ -1,0 +1,177 @@
+From c9aa666b29a33c6f2a7a6752c18ef46dd71e70d4 Mon Sep 17 00:00:00 2001
+From: ZERONYTH-dev <dev@zeronyth.invalid>
+Date: Tue, 3 Nov 2026 13:05:31 +0900
+Subject: [PATCH 7/7] docs: key rotation, PQ auth integration, FN-DSA
+ migration, ECDSA compat, validator-transition fix; README status
+
+---
+ zeronyth/README-falcon-qbft.md               | 20 ++++++++++++++--
+ zeronyth/docs/evm-ecdsa-compat.md            |  8 +++++++
+ zeronyth/docs/fn-dsa-migration.md            | 20 ++++++++++++++++
+ zeronyth/docs/key-management-and-rotation.md | 24 +++++++++++++++++++
+ zeronyth/docs/pq-auth-integration.md         | 25 ++++++++++++++++++++
+ zeronyth/docs/validator-transition-fix.md    | 18 ++++++++++++++
+ 6 files changed, 113 insertions(+), 2 deletions(-)
+ create mode 100644 zeronyth/docs/evm-ecdsa-compat.md
+ create mode 100644 zeronyth/docs/fn-dsa-migration.md
+ create mode 100644 zeronyth/docs/key-management-and-rotation.md
+ create mode 100644 zeronyth/docs/pq-auth-integration.md
+ create mode 100644 zeronyth/docs/validator-transition-fix.md
+
+diff --git a/zeronyth/README-falcon-qbft.md b/zeronyth/README-falcon-qbft.md
+index c0ca323..d7d5f13 100644
+--- a/zeronyth/README-falcon-qbft.md
++++ b/zeronyth/README-falcon-qbft.md
+@@ -34,6 +34,22 @@ Mandatory steps before touching 9127:
+ - bcprov 1.84 Falcon is round-3 Falcon, not final FIPS 206 FN-DSA. Re-key is needed when FN-DSA is final.
+ - `Falcon1024Signature` is carried through the `SECPSignature` type. The mode is a static process-wide switch.
+ - In Falcon mode, consensus messages are broadcast to all peers.
+-- Validator voting (add/remove) in Falcon mode has not been tested.
+-- The browser light client cannot verify Falcon seals. There is no JS Falcon verifier.
++- The QBFT vote RPC accepts short hex (`0x1234` → `0x…1234`); strict 20-byte parsing is not added yet.
++- The vendored `tools/vendor/light-client.mjs` (copied from 9127 tooling) still derives the next validator set from block N's extraData (latent off-by-one; see `docs/validator-transition-fix.md`). It is not changed because it is production-adjacent.
++- Static peers re-connect after ~10–15 s, so long partitions cannot be simulated without a firewall, and firewall changes are not allowed here.
++- `/v1/verify/falcon` derives an address even for a malformed public key (verification is still `false`).
+ - QBFT recovery from below-quorum is slow because of exponential round backoff. This is upstream behaviour, but there is no ECDSA baseline to compare against yet.
++
++## Status 2026-11-03 (chain 912701 test net only; 9127 untouched)
++| Area | Implemented | Tested OK | Not done |
++|---|---|---|---|
++| Key management | encrypted `falcon1024-enc-v1` (scrypt logN 17 + AES-256-GCM), password via env/file, 0600 enforced, backup/restore, rotation doc | unit tests 6/6; migration of all nodes; wrong pw/tamper/perm rejected; backup→restore; leak scan 0 hits; node4 live rotation | HSM / offline password store |
++| Validator mgmt | Falcon-signed add/remove votes (QBFT RPC) | 4→5→4 twice (~6–7 s each), invalid vote/sig/key rejected (12 Java tests), node3 full resync 3127 blocks/18 s, restart | strict vote address parsing |
++| Security / endurance | tamper/replay/wrong-chain rejection, rogue node, partitions, perf, endurance script | see `docs/` + logs; TPS 771–1059 | long partitions (no firewall); endurance **running, not passed** |
++| Explorer | 127.0.0.1:18780, browser Falcon (noble) + ML-DSA-65 cert verification, vote-tally validator tracking | full genesis sync in browser (~25 s / 5300 blocks), tamper rejected, dead RPC = NOT CONNECTED | — |
++| Integration | docs: PQ auth, FN-DSA migration, ECDSA compat; local verify API `/v1/*` | API smoke tests | deployment anywhere |
++| Falcon-signed txs | **cancelled by owner 12:43 JST**; prototype reverted (`logs/falcon-tx-cancelled.patch`) | — | all |
++
++Endurance: `falcon-net/tools/endurance.sh status|stop|start` (resumable state in `net/endurance/state.json`, log `logs/endurance-1.log`).
++Explorer: `falcon-net/explorer/ctl.sh start|stop`. Attester: `falcon-net/tools/attester-ctl.sh start|stop|status`.
++Docs: `docs/key-management-and-rotation.md`, `docs/pq-auth-integration.md`, `docs/fn-dsa-migration.md`, `docs/evm-ecdsa-compat.md`, `docs/validator-transition-fix.md`.
+diff --git a/zeronyth/docs/evm-ecdsa-compat.md b/zeronyth/docs/evm-ecdsa-compat.md
+new file mode 100644
+index 0000000..deb95a0
+--- /dev/null
++++ b/zeronyth/docs/evm-ecdsa-compat.md
+@@ -0,0 +1,8 @@
++# EVM / wallet compatibility in Falcon mode
++
++Falcon mode changes **only** QBFT consensus signatures: messages and COMMIT seals.
++- EVM transaction signing, account addresses, `ecrecover`, JSON-RPC and MetaMask stay secp256k1 ECDSA.
++- Tested: a legacy EIP-155 tx (v=0x1bda9e for chainId 912701) was included with status 1, and its `from` matched the sender (`logs/ecdsa-compat-1.log`).
++- Tested: 20 000 ECDSA load txs, all included (`logs/perf-*.log`).
++- **Not tested:** EIP-1559 (type-2) and EIP-2930 (type-1) txs, and a real MetaMask UI session.
++- Falcon-signed user transactions were **not implemented**. The owner cancelled that work at 12:43 JST on 2026-11-03. A prototype precompile was reverted, and its patch is archived in `logs/falcon-tx-cancelled.patch`.
+diff --git a/zeronyth/docs/fn-dsa-migration.md b/zeronyth/docs/fn-dsa-migration.md
+new file mode 100644
+index 0000000..6fe11a6
+--- /dev/null
++++ b/zeronyth/docs/fn-dsa-migration.md
+@@ -0,0 +1,20 @@
++# FN-DSA (FIPS 206) migration design — kept separate from today's BouncyCastle round-3 Falcon
++
++Today the code uses **round-3 Falcon-1024** (BouncyCastle bcprov 1.84 `FalconSigner`, noble `falcon1024` in JS). This is **not** FIPS 206 FN-DSA. The final standard may differ from round-3 in several ways: encodings, the hash-to-point / pre-hash mode, domain separation, and key and signature formats. Signatures and keys must not be assumed to be interchangeable.
++
++Design rules:
++1. **Explicit algorithm id everywhere.**
++   - The ZQBF envelope v1 means `falcon1024-round3-bc184`.
++   - FN-DSA gets a new envelope version or magic (e.g. `ZQBF` v2 with alg id `fn-dsa-1024`) and a new domain string (`ZERONYTH/QBFT/FN-DSA-1024/V1`).
++   - A v1 verifier must reject v2 envelopes, and the reverse.
++2. **Separate key files.**
++   - `falcon1024-enc-v1` stays round-3.
++   - FN-DSA keys use a new format id (`fndsa1024-enc-v1`). There is no in-place conversion; validators re-key.
++3. **Fork-scheduled switch.**
++   - The genesis/config option `qbft.fndsaBlock: N`. Blocks before N are verified as round-3 Falcon; blocks from N on are verified as FN-DSA.
++   - The validator set moves to FN-DSA addresses through add/remove votes before N, or through a set transition carried in block N−1.
++4. **Library gate.**
++   - Adopt FN-DSA only after the standard is final, BouncyCastle (or another library) ships a FIPS 206 implementation, and the official KATs pass in CI for both Java and JS.
++   - Keep round-3 code until all history that needs it has been checkpointed with ML-DSA-65 finality certificates.
++5. **ML-DSA-65 (FIPS 204) is unaffected.** It continues as the finality and identity root during and after the migration.
++6. Production 9127 is not part of this plan without the owner's approval.
+diff --git a/zeronyth/docs/key-management-and-rotation.md b/zeronyth/docs/key-management-and-rotation.md
+new file mode 100644
+index 0000000..279b307
+--- /dev/null
++++ b/zeronyth/docs/key-management-and-rotation.md
+@@ -0,0 +1,24 @@
++# Falcon-1024 validator key management and rotation (chain 912701 test net)
++
++## Key file format (implemented: `Falcon1024KeyFile`)
++- Format `falcon1024-enc-v1`: scrypt (N=2^17, r=8, p=1) → AES-256-GCM. Header fields are authenticated as AAD.
++- Password source (one of): `BESU_FALCON1024_KEY_PASSWORD_FILE` (preferred; must be 0600) or `BESU_FALCON1024_KEY_PASSWORD`.
++- `BESU_FALCON1024_REQUIRE_ENCRYPTED=true` refuses plaintext key files.
++- Generation, storage and loading enforce owner-only 0600 permissions. Wrong password, a tampered file, wrong permissions and a wrong format are all rejected (unit tests: `Falcon1024KeyFileTest`).
++- Backup and restore: `falcon-net/tools/key-backup.sh` (encrypted file + checksum; the restore test re-derives the same address).
++- Leak check: `falcon-net/tools/leak-scan.py` scans logs, RPC responses and the explorer/attester output for private key material and password bytes (last run: TOTAL_HITS=0).
++
++## Rotation procedure (executed once on node4: 0x5b2bb078… → 0x9330064546…)
++1. Generate the new key on the validator host (encrypted, 0600). Never copy keys between hosts.
++2. Propose an ADD vote for the new address on more than 50% of validators (`qbft_proposeValidatorVote(addr, true)`). Wait until it is in `qbft_getValidatorsByBlockNumber(latest)`.
++   n=4 becomes n=5, and the Falcon quorum becomes ceil(2·5/3)=4.
++3. Stop the node (never run two processes with the same validator key). Start it with the new key file and password file.
++4. Propose a DROP vote for the old address on more than 50% of the (now 5) validators. Wait until the set is back to 4.
++5. Update the ML-DSA attester registry. The registry binds each ML-DSA key to its Falcon validator address with a `PQ_BINDING` envelope.
++   Then restart the attester and check that the registry matches the head validator set.
++6. Archive the old key (encrypted) until no block that it sealed needs re-verification by anyone. Then destroy it.
++
++Risks:
++- While n=5, one more offline node blocks progress (quorum 4 of 5).
++- Doing step 3 before step 2 has finalized takes the validator offline. Doing step 4 before step 3 has the same effect.
++- Emergency rotation (key compromise): drop the compromised address first only if the remaining set still has a quorum. Otherwise add first.
+diff --git a/zeronyth/docs/pq-auth-integration.md b/zeronyth/docs/pq-auth-integration.md
+new file mode 100644
+index 0000000..cbc7473
+--- /dev/null
++++ b/zeronyth/docs/pq-auth-integration.md
+@@ -0,0 +1,25 @@
++# PQ authentication across L1 / AI / P2P / VPS — design (not deployed)
++
++Status: **design only**. Nothing here was applied to chain 9127, the VPS or production services.
++
++| Layer | Today | PQ design | Algorithm |
++|---|---|---|---|
++| L1 consensus (912701 test net) | Falcon-1024 seals + ML-DSA-65 finality cert | as implemented here | Falcon-1024 (round-3 BC) + ML-DSA-65 (FIPS 204) |
++| L1 consensus (9127 prod) | ECDSA QBFT + ML-DSA-65 finality cert | unchanged until owner approval (see README rollout) | — |
++| EVM accounts / wallets | secp256k1 ECDSA (MetaMask) | **unchanged** | ECDSA |
++| AI agents / services → API | bearer tokens | Challenge–response: the service issues a nonce, and the agent signs `ZERONYTH/AUTH/V1 ‖ service ‖ nonce ‖ expiry` with ML-DSA-65. The service verifies the signature against a registry of agent public keys; the registry entries are themselves signed by an ML-DSA root key. Tokens are short-lived (≤15 min) and bound to the key id. | ML-DSA-65 |
++| P2P (devp2p RLPx) | secp256k1 ECIES handshake | Keep RLPx. Add an application-level PQ attestation of the node identity: a Falcon `PQ_BINDING` from enode key to validator. A full PQ transport (ML-KEM-768 hybrid with X25519) requires a devp2p fork, so it is deferred. | ML-KEM-768 hybrid (future) |
++| VPS admin access | SSH password/key | Move to OpenSSH `sntrup761x25519` / `mlkem768x25519` KEX (OpenSSH ≥9.9) with key-only login. Disable passwords after owner approval. Store the ML-DSA-signed host-key fingerprint list in the repo. | ML-KEM hybrid KEX |
++
++Common rules:
++- Every signature carries a domain string, a chain/service id, a purpose and an expiry. Messages are never signed raw.
++- Keys are stored encrypted with 0600 permissions, one key per purpose, and rotated with the same add-then-remove pattern used for validators.
++- Verification has no network trust: verifiers pin roots (genesis hash, ML-DSA root key).
++
++## Local verification API (implemented, 127.0.0.1:18780, test net only)
++- `GET /v1/info`: chain, genesis and trust model.
++- `GET /v1/verify/block/<n|latest>`: verifies Falcon seals and quorum against the vote-tally validator set, plus the ML-DSA-65 finality certificate.
++  Returns `VERIFIED`, or `FALCON_VERIFIED_PQ_FINALITY_NOT_VERIFIED`, or `FAILED` / `NOT_CONNECTED`. It never reports success for unverified data.
++- `POST /v1/verify/falcon` `{publicKey (raw 1792 B hex), message, signature}`: raw Falcon-1024 verification (round-3) plus the derived address.
++- `POST /v1/verify/envelope` `{envelope, chainId, type, height, round, payloadHash, allowed?}`: verifies a ZQBF envelope (chainId is required).
++- `POST /v1/verify/mldsa65` `{publicKey, message, signature}`: ML-DSA-65 verification.
+diff --git a/zeronyth/docs/validator-transition-fix.md b/zeronyth/docs/validator-transition-fix.md
+new file mode 100644
+index 0000000..411d853
+--- /dev/null
++++ b/zeronyth/docs/validator-transition-fix.md
+@@ -0,0 +1,18 @@
++# Validator-set transition bug (found and fixed in test-net tooling)
++
++**QBFT semantics:**
++- Block N's `extraData.validators` is the set that seals block N. It already includes the votes of blocks ≤ N−1.
++- The votes in block N (coinbase = proposer, ADD 0xff / DROP empty) only take effect from block N+1. They apply once ≥ floor(n/2)+1 distinct proposers have voted for the same subject.
++- Epoch blocks reset all pending votes.
++
++**Bug:** the explorer, the explorer server, the ML-DSA attester and the vendored light-client all took the *next* set from block N's extraData. After the 5→4 removal, the browser sync failed at block 2927 ("quorum 3/4 of 5").
++
++**Fix:**
++- `ValidatorTracker` in `falcon-verify-core.mjs` replays the votes exactly as Besu's `VoteTally` does.
++- Every verifier checks extraData validators against the tracked set, and quorum is computed from the tracked set.
++- Full replay of 0..4006: 12 101 seals, 0 failures, with transitions at 2863, 2927, 3009 and 3028. The wrong set for 2927 is rejected.
++- A second explorer bug was fixed at the same time:
++  - Overlapping browser sync passes applied votes twice and could overwrite FAILED with VERIFIED.
++  - The fix is a re-entrancy guard; FAILED is now terminal.
++
++**Latent issue (NOT changed, production-adjacent):** `tools/vendor/light-client.mjs` (copied from the 9127 tooling) still uses `nextValidators: e.validators`. On 9127 it is harmless while the validator set never changes. The production light client should get the same tally logic before any validator vote on 9127. Changing it needs the owner's approval.
+-- 
+2.47.3
+

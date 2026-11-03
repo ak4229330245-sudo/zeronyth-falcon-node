@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ZERONYTH Falcon-1024 key tool (chain 912701 test net). Prints only PUBLIC data (format, address, public key).
+# EXPERIMENTAL: BouncyCastle 1.84 NIST round-3 Falcon-1024, NOT final FIPS 206 FN-DSA.
+#   zeronyth-falcon-key init [DIR]        create DIR/secrets/falcon.pass (random, 0600) + encrypted DIR/data/falcon1024.key
+#   zeronyth-falcon-key address [KEYFILE] show format / address / public key (no password needed)
+#   zeronyth-falcon-key generate-encrypted|encrypt|change-password|info|verify ...   raw CLI (password via
+#        BESU_FALCON1024_KEY_PASSWORD_FILE; never pass passwords on the command line)
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+command -v "$JAVA" >/dev/null || { echo "java not found: install a Java 25 runtime (see JOIN guide)"; exit 1; }
+run() { "$JAVA" -cp "$HERE/besu/lib/*" org.hyperledger.besu.crypto.Falcon1024KeyFile "$@"; }
+case "${1:-}" in
+  init)
+    D="${2:-$HOME/zeronyth-912701}"; umask 077; mkdir -p "$D/data" "$D/secrets"
+    if [ -e "$D/data/falcon1024.key" ]; then echo "key already exists (not overwritten): $D/data/falcon1024.key"; run info "$D/data/falcon1024.key" | sed -n '1,3p'; exit 0; fi
+    [ -e "$D/secrets/falcon.pass" ] || { head -c 48 /dev/urandom | base64 | tr -d '\n/+=' > "$D/secrets/falcon.pass"; chmod 600 "$D/secrets/falcon.pass"; }
+    BESU_FALCON1024_KEY_PASSWORD_FILE="$D/secrets/falcon.pass" run generate-encrypted "$D/data/falcon1024.key" | sed -n '1,3p'
+    echo "created: $D/data/falcon1024.key (encrypted, 0600) + password file $D/secrets/falcon.pass (0600). Back up BOTH offline; never share them."
+    echo "full public key: $0 address $D/data/falcon1024.key" ;;
+  address) run info "${2:-$HOME/zeronyth-912701/data/falcon1024.key}" ;;
+  ""|-h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) run "$@" ;;
+esac
