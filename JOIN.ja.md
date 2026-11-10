@@ -7,9 +7,9 @@
 参加するノードは **バリデーターではないフルノード** です。Falcon 署名付きの全ブロックを同期して検証しますが、ブロックの提案や投票はしません。バリデーターの追加には既存バリデーターの投票が必要で、運営が1件ずつ承認します（手順6）。
 
 ## 必要なもの
-- Linux x86_64 / arm64（Ubuntu 22.04 / 24.04 で確認）
+- Linux x86_64 / arm64（Ubuntu 22.04 / 24.04 で確認）、または Windows 10/11 の WSL2 Ubuntu（下の「WSL2 の注意」を参照）
 - CPU 2コア以上、メモリ 4 GB以上、SSD 20 GB以上
-- **Java 25**（このビルドは Java 25 向けです。古い Java では起動しません）
+- **Java 25**（このビルドは Java 25 向けです。Java 21 以下では起動しません。Temurin 25 で確認済み）
 - 外向きの TCP/UDP 30303。内向きの 30303 は任意です（他のノードから接続を受けたい場合だけ必要）。
 
 ## 1. Java 25 の導入とリリースのダウンロード
@@ -18,10 +18,10 @@ sudo apt update && sudo apt install -y curl python3
 mkdir -p ~/zeronyth-java && curl -fL "https://api.adoptium.net/v3/binary/latest/25/ga/linux/$(uname -m | sed 's/x86_64/x64/;s/arm64/aarch64/')/jre/hotspot/normal/eclipse" | tar xz -C ~/zeronyth-java --strip-components=1
 export JAVA_HOME=~/zeronyth-java PATH=~/zeronyth-java/bin:$PATH && java -version
 
-REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.1.1
-curl -fLO $REL/zeronyth-falcon-node-912701-v0.1.1.tar.gz -fLO $REL/SHA256SUMS
+REL=https://github.com/ak4229330245-sudo/zeronyth-falcon-node/releases/download/falcon-912701-v0.2.0
+curl -fLO $REL/zeronyth-falcon-node-912701-v0.2.0.tar.gz -fLO $REL/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing      # 「OK」と出ること
-tar xzf zeronyth-falcon-node-912701-v0.1.1.tar.gz && cd zeronyth-falcon-node-912701-v0.1.1
+tar xzf zeronyth-falcon-node-912701-v0.2.0.tar.gz && cd zeronyth-falcon-node-912701-v0.2.0
 ```
 
 ## 2. Falcon 鍵を作る（暗号化）
@@ -43,6 +43,9 @@ bin/start-fullnode.sh                 # データは ~/zeronyth-912701、P2P 303
 - 鍵が暗号化されていない
 - genesis がチェーン 912701 のものではない
 - genesis のバリデーター鍵を使おうとしている
+- genesis が本番のもの（sha256 `9772dce0…ef3d`）と違う、または `besu/lib` の jar が `besu-lib.sha256` と合わない
+- Java が 25 より古い
+- （WSL2）データの場所が `/mnt/c` などの Windows ドライブ上にある
 
 ## 4. 同期の確認
 ```bash
@@ -51,7 +54,20 @@ curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id
 ```
 https://zeronyth.dpdns.org/validator-apply.html の「最新ブロック」と同じ数字になれば同期完了です。ブロックは1秒ごとに作られます。私たちのテストでは、ピア1つの新規ノードが約10,500ブロックに1分以内で追いつきました。
 
-ログに `Unable to retrieve blocks` が出続ける場合は v0.1.0 を使っています。v0.1.1 以降に更新してください。v0.1.1 では、1つあたり約10 KBある Falcon-1024 ヘッダーの要求を小さく抑えています。
+ログに次のどちらかが出続ける場合は古い版です。下の「v0.1.x からの更新」で v0.2.0 にしてください。
+- `Unsupported transaction type` と `Unable to retrieve blocks for block numbers: 165314 to 165318`（v0.1.1 以前。ブロック 165,318 の ML-DSA-65 取引 `0x7F` を読めません）
+- 低いブロックで `Unable to retrieve blocks` が続く（v0.1.0）
+
+## v0.1.x からの更新（ブロックDBと Falcon 鍵はそのまま）
+```bash
+# 1. 古いノードを Ctrl-C で止める
+# 2. v0.2.0 をダウンロードして展開（手順1）し、そのフォルダで:
+bin/upgrade-from-v0.1.x.sh            # ~/zeronyth-912701 以外を使っていた場合はそのパスを付ける
+bin/start-fullnode.sh                 # 止まったブロックの続きから同期します
+```
+- `~/zeronyth-912701/data`（ブロックDBと `falcon1024.key`）と `secrets/falcon.pass` は消しも書き換えもしません。Falcon アドレスも変わりません。
+- 念のため、鍵とパスワードだけを `~/zeronyth-912701/backup-pre-v0.2.0-日時/` にコピーします（DBはコピーしません）。
+- 古い v0.1.x のフォルダは、更新後に消してかまいません。
 
 ## 5. 自分の enode（公開情報）
 ```bash
@@ -63,8 +79,17 @@ https://zeronyth.dpdns.org/validator-apply.html のフォームに、**enode** �
 
 ## 中身の確認
 - `SHA256SUMS` はリリースの tar.gz を対象にしています。`besu/lib` には、ZERONYTH の VPS ノードで実際に動いているものと同じ jar が入っています（ビルド `26.11-develop-c9aa666`）。
-- ソース: Hyperledger Besu `ee9c64c` に `source/patches/` の ZERONYTH パッチを当てたもの（`git am` で適用できます）。
-- genesis の sha256: `ca05069449b2baa429c95cb993d1d4af143fe22ecaec51b6a6ae5953a4f85390`
+- ソース: `source/SOURCE.md` を見てください（合意部分は `source/patches/`、PQ取引は公開リポジトリ `zeronyth` の `besu-912701/`）。
+- `besu-lib.sha256` に全 jar の sha256 があります（起動のたびに自動で確認します）。
+- genesis の sha256: `9772dce0ddee9684839afd6c33e7b6c0bf0052eb23705b83cd451adc1a91ef3d`（v0.1.x の `ca050694…` に PQ/ZK の有効化ブロックを足したもの。genesis ブロックのハッシュは同じです）
+- 対応している取引: 通常の 0x00〜0x04、Falcon-1024 `0x7E`・ML-DSA-65 `0x7F`（157,773 から）、ZK-STARK `0x7D`（242,414 から）。STARKVERIFY プリコンパイル `0x7d1`（241,814 から）。
+
+## WSL2（Windows）の注意
+- **ノードのフォルダは WSL の中（`~/zeronyth-912701` など ext4）に置いてください。** `/mnt/c/...` に置くと非常に遅く、DB が壊れやすくなります（スクリプトは `/mnt` を拒否します）。
+- メモリ: `C:\Users\<名前>\.wslconfig` に `[wsl2]` と `memory=6GB`（4GB以上）を書き、`wsl --shutdown` で反映します。
+- **時計合わせ**: スリープ復帰後に WSL の時計がずれると、最新ブロック付近で同期が止まります。`sudo hwclock -s` か `sudo timedatectl set-ntp true`（systemd 有効時）で合わせてください。`date` が実際の時刻と1秒以上ずれていないか確認できます。
+- 外からの接続は WSL2 の NAT で届きません。同期は外向きの接続だけで問題なくできます。
+- Windows のスリープ中はノードも止まります。起動し直すと続きから同期します。
 
 ## 停止・削除
 Ctrl-C で安全に停止します。削除するときは `~/zeronyth-912701` とリリースのフォルダを消してください。同じアドレスを使い続けたい場合は、先に鍵をバックアップしてください。

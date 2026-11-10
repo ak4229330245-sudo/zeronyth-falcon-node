@@ -10,7 +10,11 @@
    "epochlength": 30000,
    "requesttimeoutseconds": 2,
    "falcon1024": true
-  }
+  },
+  "pqTxActivationBlock": 157773,
+  "zkPrecompileActivationBlock": 241814,
+  "zkTxActivationBlock": 242414,
+  "zkPoolAddress": "0xb69ba292fb84d3ab86aed617ba2a8fb4b38e7862"
  },
  "nonce": "0x0",
  "timestamp": "0x0",
